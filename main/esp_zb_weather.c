@@ -16,6 +16,7 @@
 #include "nvs_flash.h"
 #include "ha/esp_zigbee_ha_standard.h"
 #include "esp_zb_weather.h"
+#include "esp_zb_ota.h"
 #include "sleep_manager.h"
 #include "driver/gpio.h"
 #include "bme280_app.h"
@@ -214,6 +215,12 @@ static esp_err_t zb_action_handler(esp_zb_core_action_callback_id_t callback_id,
     switch (callback_id) {
     case ESP_ZB_CORE_SET_ATTR_VALUE_CB_ID:
         ret = zb_attribute_handler((esp_zb_zcl_set_attr_value_message_t *)message);
+        break;
+    case ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID:
+        ret = zb_ota_upgrade_value_handler(*(esp_zb_zcl_ota_upgrade_value_message_t *)message);
+        break;
+    case ESP_ZB_CORE_OTA_UPGRADE_QUERY_IMAGE_RESP_CB_ID:
+        ret = zb_ota_query_image_resp_handler(*(esp_zb_zcl_ota_upgrade_query_image_resp_message_t *)message);
         break;
     case ESP_ZB_CORE_REPORT_ATTR_CB_ID:
         {
@@ -496,6 +503,15 @@ static void esp_zb_task(void *pvParameters)
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_BUTTON_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_BME280_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_RAIN_GAUGE_ENDPOINT, &info);
+
+    /* Add OTA cluster to endpoint 1 for firmware updates */
+    esp_zb_ota_cluster_cfg_t ota_cluster_cfg = {
+        .ota_upgrade_manufacturer = OTA_UPGRADE_MANUFACTURER,
+        .ota_upgrade_image_type = OTA_UPGRADE_IMAGE_TYPE,
+    };
+    esp_zb_attribute_list_t *esp_zb_ota_client_cluster = esp_zb_ota_cluster_create(&ota_cluster_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_ota_cluster(esp_zb_light1_clusters, esp_zb_ota_client_cluster, ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE));
+    ESP_LOGI(TAG, "📦 OTA cluster added to endpoint %d", HA_ESP_LIGHT1_ENDPOINT);
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
@@ -1031,6 +1047,9 @@ void app_main(void)
 {
     /* Initialize NVS */
     ESP_ERROR_CHECK(nvs_flash_init());
+    
+    /* Initialize OTA */
+    ESP_ERROR_CHECK(esp_zb_ota_init());
     
     /* Check wake-up reason and print statistics */
     wake_reason_t wake_reason = check_wake_reason();
