@@ -10,7 +10,7 @@
 
 ## Project Description
 
-This project implements a battery-powered environmental monitoring device using ESP32-C6/H2 with Zigbee connectivity. The device features a simplified 2-endpoint design focused on essential weather station functionality, optimized for low-power operation with deep sleep support.
+This project implements a battery-powered environmental monitoring device using ESP32-C6/H2 with Zigbee connectivity. The device features a 3-endpoint design with remote sleep configuration, optimized for low-power operation with deep sleep support and extended wake time during network join.
 
 This project is based on the examples provided in the ESP Zigbee SDK:
 
@@ -25,6 +25,7 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 |----------|-------------|----------|-------------|
 | **1** | Environmental Sensor | Temperature, Humidity, Pressure | BME280 sensor via I2C |
 | **2** | Rain Gauge | Analog Input | Tipping bucket rain sensor with rainfall totals |
+| **3** | Sleep Configuration | Analog Input | Remote sleep duration control (60-7200 seconds) |
 
 ### 📋 Detailed Endpoint Descriptions
 
@@ -36,7 +37,7 @@ This project is based on the examples provided in the ESP Zigbee SDK:
   - 🌡️ **Temperature**: -40°C to +85°C (±1°C accuracy)
   - 💧 **Humidity**: 0-100% RH (±3% accuracy) 
   - 🌪️ **Pressure**: 300-1100 hPa (±1 hPa accuracy)
-- **Features**: Automatic 30-second reporting, Zigbee-standard units
+- **Features**: Automatic reporting during wake cycles, Zigbee-standard units
 - **Use Case**: Weather monitoring, HVAC automation, air quality tracking
 
 #### **Endpoint 2: Rain Gauge System**
@@ -55,6 +56,19 @@ This project is based on the examples provided in the ESP Zigbee SDK:
   - Accuracy: ±0.36mm per bucket tip
   - Storage: Non-volatile total persistence across reboots
 - **Use Case**: Weather station, irrigation control, flood monitoring
+
+#### **Endpoint 3: Sleep Configuration**
+- **Hardware**: Software-only (virtual endpoint)
+- **Control**: Sleep duration in seconds (60-7200s range)
+- **Features**:
+  - Remote configuration via Zigbee2MQTT or Home Assistant
+  - Persistent storage (NVS) - survives reboots
+  - Real-time updates - changes apply on next wake cycle
+  - Default: 900 seconds (15 minutes)
+- **Use Case**: 
+  - Battery optimization (longer intervals = longer battery life)
+  - Seasonal adjustments (frequent updates in rainy season)
+  - Dynamic power management based on weather conditions
 
 ### 🔧 Hardware Configuration
 
@@ -92,19 +106,24 @@ GPIO 9  - Built-in button (factory reset)
 - **OTA Support**: Over-the-air firmware updates enabled (see [OTA_GUIDE.md](OTA_GUIDE.md))
 
 ### ⚡ Power Management
-- **Deep Sleep Mode**: Adaptive intervals based on network connection
-  - **Connected**: 15-minute intervals (configurable via Zigbee2MQTT)
+- **Deep Sleep Mode**: Configurable intervals (60-7200 seconds, default 15 minutes)
+  - **Configurable via Zigbee2MQTT**: Adjust sleep duration remotely from Home Assistant
+  - **Connected**: Uses configured interval (default 15 minutes)
   - **Disconnected**: 30-second intervals for quick reconnection
-  - **Max retries**: After 20 attempts (10 minutes), reduces to 7.5-minute intervals
+  - **Max retries**: After 20 attempts (10 minutes), reduces to half configured duration
+  - **Extended wake time**: Device stays awake for 60 seconds when not connected (instead of 10s) to allow Zigbee join process to complete
 - **Wake-up Sources**:
-  - Timer (adaptive based on network status)
+  - Timer (configurable 60-7200 seconds)
   - **Rain detection during deep sleep** (both targets support RTC wake-up)
     - **ESP32-H2**: GPIO12 (RTC-capable)
     - **ESP32-C6**: GPIO5 (RTC-capable)
-- **Network Retry Logic**: Prevents deep sleep when not connected to ensure reliable pairing
+- **Network Retry Logic**: 
+  - Prevents deep sleep when not connected to ensure reliable pairing
+  - Extended 60-second wake period for join process completion
+  - Connection success triggers 15-second reporting window before sleep
 - **Battery Life**: Optimized for extended operation on battery power
 - **Power Consumption**: ~100mA active, 7-10µA in deep sleep
-- **Battery Estimate**: 3+ years with 2500mAh battery (when connected)
+- **Battery Estimate**: 3+ years with 2500mAh battery (15-minute intervals)
 
 ## 🚀 Quick Start
 
@@ -148,16 +167,18 @@ idf.py -p [PORT] flash monitor
   - Long press (5s): Factory reset device
 
 #### **Automatic Features**
-- Environmental data reported every 30 seconds (when awake)
+- Environmental data reported during wake cycles
 - Rain gauge totals stored persistently in NVS
 - Smart rainfall reporting (1mm increments or hourly)
 - Network connection status monitoring
-- Deep sleep after 10 seconds of operation
+- Deep sleep after data reporting (15-second window when connected, 60 seconds when not connected)
+- Sleep duration remotely configurable via Zigbee2MQTT (60-7200 seconds)
 
 ### 📡 Data Reporting
 - **Temperature/Humidity/Pressure**: Reported during wake cycles
 - **Rainfall**: Immediate on tip detection (>1mm) or hourly
-- **Sleep Cycle**: 15-minute intervals for battery conservation
+- **Sleep Duration**: Configurable 60-7200 seconds (default 15 minutes)
+- **Sleep Cycle**: Configurable via Endpoint 3 for battery optimization
 
 ## 📊 Example Output
 
@@ -207,28 +228,39 @@ When connected to Zigbee2MQTT or other Zigbee coordinators, the device appears a
 
 - **3x Sensor entities**: Temperature, Humidity, Pressure  
 - **1x Sensor entity**: Rainfall total with automatic updates
+- **1x Number entity**: Sleep duration control (60-7200 seconds)
+
+### Zigbee2MQTT Integration
+
+A custom external converter is provided for full feature support with Zigbee2MQTT. See [ZIGBEE2MQTT_CONVERTER.md](ZIGBEE2MQTT_CONVERTER.md) for:
+- Converter installation instructions
+- Multi-endpoint support configuration
+- Sleep duration control setup
+- Home Assistant automation examples
 
 ### Device Information
 - **Manufacturer**: ESPRESSIF
-- **Model**: WeatherStation  
-- **Firmware**: v1.0.0
-- **Supported**: Automatic device detection in Zigbee2MQTT
+- **Model**: CAELUM-WS  
+- **Firmware**: Configurable via CMakeLists.txt (default v0.1.0)
+- **Supported**: Zigbee2MQTT with custom external converter
 
 ## 🔧 Configuration
 
 Key parameters can be adjusted in `main/esp_zb_weather.h`:
-- Sleep duration (default: 15 minutes)
-- Reporting intervals
-- Rain tip bucket volume (default: 0.36mm)
-- Wake-up thresholds
+- Default sleep duration: 900 seconds (15 minutes) - can be changed via Endpoint 3
+- Sleep duration range: 60-7200 seconds (1 minute to 2 hours)
+- Network retry interval: 30 seconds when disconnected
+- Maximum connection retries: 20 attempts before reducing sleep interval
+- Rain tip bucket volume: 0.36mm per tip
+- Extended wake time: 60 seconds when not connected (for join process)
 
 ## 📝 Project Structure
 
 ```
 WeatherStation/
 ├── main/
-│   ├── esp_zb_weather.c     # Main Zigbee stack and sensor logic
-│   ├── esp_zb_weather.h     # Configuration and headers
+│   ├── esp_zb_weather.c     # Main Zigbee stack, 3-endpoint logic, network retry
+│   ├── esp_zb_weather.h     # Configuration, endpoint definitions, firmware version
 │   ├── esp_zb_ota.c         # OTA update implementation
 │   ├── esp_zb_ota.h         # OTA interface
 │   ├── sleep_manager.c      # Deep sleep management with RTC GPIO support
@@ -237,10 +269,12 @@ WeatherStation/
 │   ├── bme280_app.h         # BME280 interface
 │   ├── weather_driver.c     # DEPRECATED: Legacy driver (unused)
 │   └── weather_driver.h     # DEPRECATED: Legacy interface (unused)
+├── caelum-weather-station.js # Zigbee2MQTT external converter
 ├── CMakeLists.txt           # Build configuration with app_update dependency
 ├── partitions.csv           # Partition table with OTA support
 ├── sdkconfig.defaults       # Default SDK settings
 ├── OTA_GUIDE.md            # OTA update instructions
+├── ZIGBEE2MQTT_CONVERTER.md # Zigbee2MQTT integration guide
 ├── DEEP_SLEEP_IMPLEMENTATION.md # Deep sleep implementation details
 └── README.md               # This file
 ```
@@ -267,7 +301,9 @@ WeatherStation/
 - Ensure Zigbee coordinator is in pairing mode
 - Check channel compatibility between coordinator and device
 - **Auto-retry**: Device automatically retries every 30 seconds when disconnected
+- **Extended wake time**: Device now stays awake for 60 seconds (instead of 10s) during join attempts
 - **Battery impact**: Extended connection attempts may drain battery faster
+- **Join timing**: Allow full 60 seconds for device to complete Zigbee join process
 
 #### **Device Not Waking from Sleep**
 - Check battery voltage (minimum 3.0V recommended)
@@ -306,7 +342,11 @@ This project follows dual licensing:
 
 ## 🔄 Based On
 
-This project is derived from ESP32 Zigbee SDK examples and inherits the multi-endpoint architecture optimized for battery-powered weather station applications with deep sleep support.
+This project is derived from ESP32 Zigbee SDK examples and implements a 3-endpoint architecture optimized for battery-powered weather station applications with:
+- Remote sleep duration configuration (Endpoint 3)
+- Deep sleep power management with network retry logic
+- Extended wake time during Zigbee join process (60 seconds)
+- RTC GPIO wake-up support for rain detection on both ESP32-H2 and ESP32-C6
 
 ## 🤝 Contributing
 
@@ -326,7 +366,8 @@ If you find this project useful, consider supporting the development:
 
 ---
 
-**Project**: ESP32 Zigbee Weather Station  
-**Version**: v1.0.0  
+**Project**: Caelum - ESP32 Zigbee Weather Station  
+**Version**: Configurable via CMakeLists.txt (default v0.1.0)
 **Compatible**: ESP32-C6, ESP32-H2, ESP-IDF v5.5.1+  
-**License**: GPL v3 (Software) / CC BY-NC-SA 4.0 (Hardware)
+**License**: GPL v3 (Software) / CC BY-NC-SA 4.0 (Hardware)  
+**Features**: 3-endpoint design, remote sleep config, OTA updates, RTC wake-up

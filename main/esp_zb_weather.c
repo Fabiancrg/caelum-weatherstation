@@ -46,8 +46,6 @@ static const char *TAG = "WEATHER_STATION";
 #define RAIN_GAUGE_GPIO         5               // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-C6)
 #endif
 #define RAIN_MM_PER_PULSE       0.36f           // mm of rain per bucket tip (adjust for your sensor)
-#define RAIN_NVS_NAMESPACE      "rain_gauge"
-#define RAIN_NVS_KEY            "total_mm"
 
 /* Rain gauge variables */
 static QueueHandle_t rain_gauge_evt_queue = NULL;
@@ -86,8 +84,6 @@ static void rain_gauge_init(void);
 static void rain_gauge_isr_handler(void *arg);
 static void rain_gauge_task(void *arg);
 static void rain_gauge_zigbee_update(uint8_t param);
-static esp_err_t rain_gauge_load_total(void);
-static esp_err_t rain_gauge_save_total(void);
 static void rain_gauge_enable_isr(void);
 static void rain_gauge_disable_isr(void);
 static bool rain_gauge_should_report(void);
@@ -160,18 +156,41 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
         break;
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
+        /* Always initialize drivers regardless of Zigbee stack status */
+        ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
+        
         if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Deferred driver initialization %s", deferred_driver_init() ? "failed" : "successful");
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
             if (esp_zb_bdb_is_factory_new()) {
                 ESP_LOGI(TAG, "Start network steering");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
-                ESP_LOGI(TAG, "Device rebooted");
+                ESP_LOGI(TAG, "Device rebooted - was previously connected");
+                /* Device was previously paired - mark as connected and enable rain gauge */
+                zigbee_network_connected = true;
+                rain_gauge_enable_isr();
+                ESP_LOGI(TAG, "📡 Re-enabled rain gauge after reboot (previously connected network)");
+                
+                /* Schedule sensor data reporting and sleep after wake-up from deep sleep */
+                ESP_LOGI(TAG, "📊 Scheduling sensor data reporting after wake-up");
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 2000); // Report in 2 seconds
+                esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 3000); // Report rainfall in 3 seconds
+                
+                /* Schedule deep sleep after reporting window */
+                if (!deep_sleep_scheduled) {
+                    ESP_LOGI(TAG, "⏰ Scheduling deep sleep after reporting window (15 seconds)");
+                    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000);
+                    deep_sleep_scheduled = true;
+                }
             }
         } else {
-            /* commissioning failed */
-            ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", esp_err_to_name(err_status));
+            /* commissioning failed - try to rejoin */
+            ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s), attempting to rejoin", esp_err_to_name(err_status));
+            if (!esp_zb_bdb_is_factory_new()) {
+                /* Device was previously connected, try to rejoin */
+                ESP_LOGI(TAG, "Attempting to rejoin previous network");
+                esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            }
         }
         break;
     case ESP_ZB_BDB_SIGNAL_STEERING:
@@ -331,6 +350,15 @@ static void prepare_for_deep_sleep(uint8_t param)
 {
     ESP_LOGI(TAG, "✅ Zigbee operations complete, preparing for deep sleep...");
     
+    /* Force final sensor reporting before sleep */
+    if (zigbee_network_connected) {
+        ESP_LOGI(TAG, "📊 Sending final sensor reports before deep sleep...");
+        bme280_read_and_report(0);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay between reports
+        rain_gauge_zigbee_update(0);
+        vTaskDelay(pdMS_TO_TICKS(500)); // Allow time for Zigbee transmission
+    }
+    
     /* Reset deep sleep scheduling flag */
     deep_sleep_scheduled = false;
     
@@ -363,6 +391,11 @@ static void prepare_for_deep_sleep(uint8_t param)
     ESP_LOGI(TAG, "💤 Entering deep sleep for %lu seconds...", sleep_duration);
     
     /* Give time for log output */
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    /* Suspend Zigbee stack before deep sleep (required for ESP32-H2) */
+    ESP_LOGI(TAG, "📴 Suspending Zigbee stack before deep sleep...");
+    esp_zb_sleep_enable(true);
     vTaskDelay(pdMS_TO_TICKS(100));
     
     /* Enter deep sleep with timer and GPIO wake-up enabled */
@@ -652,56 +685,15 @@ static void bme280_read_and_report(uint8_t param)
 }
 
 /* Rain gauge implementation */
-static esp_err_t rain_gauge_load_total(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t ret = nvs_open(RAIN_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGI(RAIN_TAG, "No previous rainfall data found, starting from 0.0mm");
-        total_rainfall_mm = 0.0f;
-        return ESP_OK;
-    }
-    
-    size_t required_size = sizeof(float);
-    ret = nvs_get_blob(nvs_handle, RAIN_NVS_KEY, &total_rainfall_mm, &required_size);
-    if (ret != ESP_OK) {
-        ESP_LOGI(RAIN_TAG, "No previous rainfall data found, starting from 0.0mm");
-        total_rainfall_mm = 0.0f;
-    } else {
-        ESP_LOGI(RAIN_TAG, "Loaded previous rainfall total: %.2f mm", total_rainfall_mm);
-    }
-    
-    nvs_close(nvs_handle);
-    return ESP_OK;
-}
-
-static esp_err_t rain_gauge_save_total(void)
-{
-    nvs_handle_t nvs_handle;
-    esp_err_t ret = nvs_open(RAIN_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(RAIN_TAG, "Failed to open NVS namespace: %s", esp_err_to_name(ret));
-        return ret;
-    }
-    
-    ret = nvs_set_blob(nvs_handle, RAIN_NVS_KEY, &total_rainfall_mm, sizeof(float));
-    if (ret != ESP_OK) {
-        ESP_LOGE(RAIN_TAG, "Failed to save rainfall total: %s", esp_err_to_name(ret));
-    } else {
-        ret = nvs_commit(nvs_handle);
-        if (ret == ESP_OK) {
-            ESP_LOGD(RAIN_TAG, "Saved rainfall total: %.2f mm", total_rainfall_mm);
-        }
-    }
-    
-    nvs_close(nvs_handle);
-    return ret;
-}
-
 static void IRAM_ATTR rain_gauge_isr_handler(void *arg)
 {
     uint32_t gpio_num = RAIN_GAUGE_GPIO;
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    
+    // ISR-safe: just increment a counter for debugging (can view in logs after interrupt)
+    static uint32_t isr_trigger_count = 0;
+    isr_trigger_count++;
+    
     xQueueSendFromISR(rain_gauge_evt_queue, &gpio_num, &xHigherPriorityTaskWoken);
     
     if (xHigherPriorityTaskWoken) {
@@ -713,25 +705,32 @@ static void rain_gauge_task(void *arg)
 {
     uint32_t io_num;
     TickType_t last_pulse_time = 0;
+    TickType_t last_debug_time = 0;
     const TickType_t DEBOUNCE_TIME = pdMS_TO_TICKS(200); // 200ms debounce - more than adequate for rain gauge
     const TickType_t BOUNCE_SETTLE_TIME = pdMS_TO_TICKS(1000); // 1 second to completely eliminate bounce issues
+    const TickType_t DEBUG_INTERVAL = pdMS_TO_TICKS(5000); // Log GPIO state every 5 seconds
     
     ESP_LOGI(RAIN_TAG, "Rain gauge task started, waiting for events...");
     
     for (;;) {
-        if (xQueueReceive(rain_gauge_evt_queue, &io_num, portMAX_DELAY)) {
-            ESP_LOGI(RAIN_TAG, "🔍 Rain gauge interrupt received on GPIO%u (enabled: %s)", io_num, rain_gauge_enabled ? "YES" : "NO");
+        // Wait for queue with timeout to allow periodic debug logging
+        if (xQueueReceive(rain_gauge_evt_queue, &io_num, pdMS_TO_TICKS(100))) {
+            TickType_t current_time = xTaskGetTickCount();
+            int pin_level_isr = gpio_get_level(RAIN_GAUGE_GPIO);
+            
+            ESP_LOGI(RAIN_TAG, "🔍 ISR TRIGGERED on GPIO%u! GPIO level: %d, enabled: %s", 
+                     io_num, pin_level_isr, rain_gauge_enabled ? "YES" : "NO");
             
             // Only process if rain gauge is enabled (connected to network)
             if (!rain_gauge_enabled) {
-                ESP_LOGW(RAIN_TAG, "Rain gauge interrupt ignored - not connected to network");
+                ESP_LOGW(RAIN_TAG, "⚠️  Rain gauge interrupt IGNORED - not connected to network");
                 continue;
             }
             
-            TickType_t current_time = xTaskGetTickCount();
             uint32_t time_diff_ms = pdTICKS_TO_MS(current_time - last_pulse_time);
             
-            ESP_LOGI(RAIN_TAG, "🕐 Time since last pulse: %u ms (debounce: %u ms)", time_diff_ms, pdTICKS_TO_MS(DEBOUNCE_TIME));
+            ESP_LOGI(RAIN_TAG, "🕐 Time since last pulse: %u ms (debounce threshold: %u ms)", 
+                     time_diff_ms, pdTICKS_TO_MS(DEBOUNCE_TIME));
             
             // Reasonable debounce check - 100ms minimum between pulses
             if ((current_time - last_pulse_time) > DEBOUNCE_TIME) {
@@ -758,9 +757,9 @@ static void rain_gauge_task(void *arg)
                         ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u detected! Total: %.2f mm (+%.2f mm)", 
                                  rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
                         
-                        // Save to NVS every 10 pulses
+                        // Save to NVS every 10 pulses (via sleep manager for unified storage)
                         if (rain_pulse_count % 10 == 0) {
-                            rain_gauge_save_total();
+                            save_rainfall_data(total_rainfall_mm, rain_pulse_count);
                         }
                         
                         // Check if we should report to Zigbee (every hour or 1mm increment)
@@ -793,13 +792,23 @@ static void rain_gauge_task(void *arg)
                             }
                         }
                     } else {
-                        ESP_LOGW(RAIN_TAG, "❌ Rain pulse rejected - signal not stable (bounce detected)");
+                        ESP_LOGW(RAIN_TAG, "❌ Rain pulse REJECTED - signal not stable after 20ms (bounce detected)");
                     }
                 } else {
-                    ESP_LOGW(RAIN_TAG, "❌ Rain pulse rejected - pin low during interrupt (noise)");
+                    ESP_LOGW(RAIN_TAG, "❌ Rain pulse REJECTED - GPIO%d is LOW during interrupt (expected HIGH, check wiring!)", RAIN_GAUGE_GPIO);
                 }
             } else {
-                ESP_LOGW(RAIN_TAG, "⏱️ Rain pulse ignored - debounce protection (%ums not elapsed)", pdTICKS_TO_MS(DEBOUNCE_TIME));
+                ESP_LOGW(RAIN_TAG, "⏱️ Rain pulse IGNORED - debounce protection active (%ums < %ums threshold)", 
+                         time_diff_ms, pdTICKS_TO_MS(DEBOUNCE_TIME));
+            }
+        } else {
+            // Timeout - periodic debug logging when enabled and connected
+            TickType_t current_time = xTaskGetTickCount();
+            if (rain_gauge_enabled && (current_time - last_debug_time) > DEBUG_INTERVAL) {
+                int current_level = gpio_get_level(RAIN_GAUGE_GPIO);
+                ESP_LOGI(RAIN_TAG, "🔧 Periodic check - GPIO%d level: %d, enabled: YES, total: %.2fmm", 
+                         RAIN_GAUGE_GPIO, current_level, total_rainfall_mm);
+                last_debug_time = current_time;
             }
         }
     }
@@ -967,8 +976,19 @@ static void rain_gauge_init(void)
     /* Start disabled - will be enabled when connected to network */
     rain_gauge_enabled = false;
     
-    /* Load previous rainfall total from NVS */
-    rain_gauge_load_total();
+    /* Load previous rainfall total from sleep manager (which handles both RTC and NVS) */
+    float loaded_rainfall = 0.0f;
+    uint32_t loaded_pulses = 0;
+    load_rainfall_data(&loaded_rainfall, &loaded_pulses);
+    
+    total_rainfall_mm = loaded_rainfall;
+    rain_pulse_count = loaded_pulses;
+    
+    if (loaded_rainfall > 0.0f || loaded_pulses > 0) {
+        ESP_LOGI(RAIN_TAG, "Loaded previous rainfall total: %.2f mm (%lu pulses)", total_rainfall_mm, rain_pulse_count);
+    } else {
+        ESP_LOGI(RAIN_TAG, "No previous rainfall data found, starting from 0.0mm");
+    }
     
     /* Configure GPIO for rain gauge */
     gpio_config_t io_conf = {
@@ -1022,7 +1042,10 @@ static void rain_gauge_init(void)
     last_reported_rainfall_mm = total_rainfall_mm;
     last_report_time = xTaskGetTickCount();
     
+    /* Add continuous GPIO monitoring for debugging */
     ESP_LOGI(RAIN_TAG, "Rain gauge initialized successfully. Current total: %.2f mm", total_rainfall_mm);
+    ESP_LOGI(RAIN_TAG, "🔧 GPIO%d monitoring: level=%d, pull-down=enabled, trigger=RISING_EDGE", 
+             RAIN_GAUGE_GPIO, gpio_get_level(RAIN_GAUGE_GPIO));
     
     /* Report initial value to Zigbee after device joins network */
     esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 10000); // 10 seconds delay
