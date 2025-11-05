@@ -267,7 +267,7 @@ uint32_t estimate_battery_life(uint32_t battery_mah)
  * @param recent_rainfall_mm Recent rainfall in last sleep cycle
  * @return Sleep duration in seconds
  */
-uint32_t get_adaptive_sleep_duration(float recent_rainfall_mm)
+uint32_t get_adaptive_sleep_duration(float recent_rainfall_mm, uint32_t base_duration_seconds)
 {
     /* If it's raining heavily, check more frequently */
     if (recent_rainfall_mm > RAIN_MM_THRESHOLD) {
@@ -276,8 +276,8 @@ uint32_t get_adaptive_sleep_duration(float recent_rainfall_mm)
         return 5 * 60; // 5 minutes during active rain
     }
     
-    /* Normal sleep duration */
-    return SLEEP_DURATION_S; // 15 minutes default
+    /* Use configurable base sleep duration */
+    return base_duration_seconds;
 }
 
 /**

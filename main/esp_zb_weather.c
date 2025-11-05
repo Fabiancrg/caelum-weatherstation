@@ -43,7 +43,7 @@ static const char *TAG = "WEATHER_STATION";
 #ifdef CONFIG_IDF_TARGET_ESP32H2
 #define RAIN_GAUGE_GPIO         12              // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-H2)
 #else
-#define RAIN_GAUGE_GPIO         18              // GPIO pin for rain gauge reed switch
+#define RAIN_GAUGE_GPIO         5               // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-C6)
 #endif
 #define RAIN_MM_PER_PULSE       0.36f           // mm of rain per bucket tip (adjust for your sensor)
 #define RAIN_NVS_NAMESPACE      "rain_gauge"
@@ -59,12 +59,29 @@ static bool rain_gauge_isr_installed = false;  // Track ISR installation state
 static float last_reported_rainfall_mm = 0.0f;  // Track last reported value for 1mm threshold
 static TickType_t last_report_time = 0;  // Track last report time for hourly reporting
 
+/* Sleep configuration variables */
+static uint32_t sleep_duration_seconds = SLEEP_DURATION_S;  // Default 15 minutes (900 seconds)
+static const char *SLEEP_CONFIG_TAG = "SLEEP_CONFIG";
+#define SLEEP_CONFIG_NVS_NAMESPACE      "sleep_config"
+#define SLEEP_CONFIG_NVS_KEY            "duration_sec"
+#define SLEEP_CONFIG_ATTR_ID            0x8000  // Custom attribute ID for sleep duration
+
+/* Network connection status */
+static bool zigbee_network_connected = false;
+static uint32_t connection_retry_count = 0;
+static bool deep_sleep_scheduled = false;  // Track if deep sleep has been scheduled
+#define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
+#define MAX_CONNECTION_RETRIES          20      // Max retries before giving up (10 minutes total)
+
 /* Button action tracking (no state needed for action-based buttons) */
 
 /********************* Define functions **************************/
 static void builtin_button_callback(button_action_t action);
 static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
+static void prepare_for_deep_sleep(uint8_t param);
+static esp_err_t sleep_config_load(void);
+static esp_err_t sleep_config_save(void);
 static void rain_gauge_init(void);
 static void rain_gauge_isr_handler(void *arg);
 static void rain_gauge_task(void *arg);
@@ -120,6 +137,9 @@ static esp_err_t deferred_driver_init(void)
     /* Initialize rain gauge */
     rain_gauge_init();
     
+    /* Load sleep configuration */
+    sleep_config_load();
+    
     return ESP_OK;
 }
 
@@ -163,14 +183,32 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
             
+            /* Mark network as connected and reset retry count */
+            zigbee_network_connected = true;
+            connection_retry_count = 0;
+            
             /* Enable rain gauge now that we're connected */
             rain_gauge_enable_isr();
             ESP_LOGI(RAIN_TAG, "Rain gauge enabled - device connected to Zigbee network");
+            
+            /* Now that we're connected, schedule normal deep sleep after allowing time for data reporting */
+            if (!deep_sleep_scheduled) {
+                ESP_LOGI(TAG, "📡 Network connected! Scheduling sleep after sensor data reporting (15 seconds)");
+                esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000); // 15 seconds for reporting
+                deep_sleep_scheduled = true;
+            }
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
+            
+            /* Mark network as disconnected and increment retry count */
+            zigbee_network_connected = false;
+            connection_retry_count++;
+            
             /* Disable rain gauge when not connected */
             rain_gauge_disable_isr();
             ESP_LOGW(RAIN_TAG, "Rain gauge disabled - not connected to network");
+            
+            ESP_LOGW(TAG, "🔄 Connection attempt %d/%d failed", connection_retry_count, MAX_CONNECTION_RETRIES);
             esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
         }
         break;
@@ -191,7 +229,37 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
     ESP_LOGI(TAG, "Received message: endpoint(%d), cluster(0x%x), attribute(0x%x), data size(%d)", message->info.dst_endpoint, message->info.cluster,
              message->attribute.id, message->attribute.data.size);
     
-    /* No attribute handling needed for read-only sensor endpoints */
+    /* Handle sleep duration configuration via analog input cluster */
+    if (message->info.dst_endpoint == HA_ESP_SLEEP_CONFIG_ENDPOINT && 
+        message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT &&
+        message->attribute.id == ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID) {
+        
+        if (message->attribute.data.size == sizeof(float)) {
+            float new_duration_float = *(float*)message->attribute.data.value;
+            uint32_t new_duration = (uint32_t)new_duration_float;
+            
+            // Validate range: 60 seconds (1 minute) to 7200 seconds (2 hours)
+            if (new_duration >= 60 && new_duration <= 7200) {
+                sleep_duration_seconds = new_duration;
+                sleep_config_save();
+                
+                /* Update the analog input present value to reflect the accepted value */
+                float accepted_value = (float)sleep_duration_seconds;
+                esp_zb_zcl_set_attribute_val(HA_ESP_SLEEP_CONFIG_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+                                           &accepted_value, false);
+                
+                ESP_LOGI(SLEEP_CONFIG_TAG, "🔧 Sleep duration updated to %d seconds (%.1f minutes) via Zigbee", 
+                         sleep_duration_seconds, sleep_duration_seconds / 60.0f);
+            } else {
+                ESP_LOGW(SLEEP_CONFIG_TAG, "Invalid sleep duration %d (must be 60-7200 seconds)", new_duration);
+                ret = ESP_ERR_INVALID_ARG;
+            }
+        } else {
+            ESP_LOGW(SLEEP_CONFIG_TAG, "Invalid data size for sleep duration: %d", message->attribute.data.size);
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+    }
     
     return ret;
 }
@@ -263,16 +331,36 @@ static void prepare_for_deep_sleep(uint8_t param)
 {
     ESP_LOGI(TAG, "✅ Zigbee operations complete, preparing for deep sleep...");
     
+    /* Reset deep sleep scheduling flag */
+    deep_sleep_scheduled = false;
+    
     /* Save rainfall data before sleeping */
     float current_rainfall = total_rainfall_mm;
     uint32_t current_pulses = rain_pulse_count;
     save_rainfall_data(current_rainfall, current_pulses);
     
-    /* Determine sleep duration based on recent activity */
-    uint32_t sleep_duration = get_adaptive_sleep_duration(0.0f);
+    /* Determine sleep duration based on network connection status */
+    uint32_t sleep_duration;
     
-    ESP_LOGI(TAG, "💤 Entering deep sleep for %lu seconds (%lu minutes)...", 
-             sleep_duration, sleep_duration / 60);
+    if (!zigbee_network_connected) {
+        if (connection_retry_count >= MAX_CONNECTION_RETRIES) {
+            /* After max retries, use longer sleep to save battery but keep trying */
+            sleep_duration = sleep_duration_seconds / 2;  // Use half the configured duration
+            ESP_LOGW(TAG, "🔋 Max connection retries reached, using reduced sleep duration: %lu seconds", sleep_duration);
+        } else {
+            /* Not connected - short sleep for quick retry */
+            sleep_duration = NETWORK_RETRY_SLEEP_DURATION;
+            ESP_LOGW(TAG, "📡 Not connected to network, using short sleep for retry: %lu seconds (attempt %d/%d)", 
+                     sleep_duration, connection_retry_count + 1, MAX_CONNECTION_RETRIES);
+        }
+    } else {
+        /* Connected - use normal adaptive sleep duration */
+        sleep_duration = get_adaptive_sleep_duration(0.0f, sleep_duration_seconds);
+        ESP_LOGI(TAG, "� Connected to network, using normal sleep duration: %lu seconds (%.1f minutes)", 
+                 sleep_duration, sleep_duration / 60.0f);
+    }
+    
+    ESP_LOGI(TAG, "💤 Entering deep sleep for %lu seconds...", sleep_duration);
     
     /* Give time for log output */
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -378,6 +466,45 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_rain_clusters, endpoint_rain_config);
 
+    /* CREATE SLEEP CONFIGURATION ENDPOINT */
+    esp_zb_cluster_list_t *esp_zb_sleep_clusters = esp_zb_zcl_cluster_list_create();
+    
+    /* Create Basic cluster for sleep config endpoint */
+    esp_zb_basic_cluster_cfg_t basic_sleep_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *esp_zb_basic_sleep_cluster = esp_zb_basic_cluster_create(&basic_sleep_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(esp_zb_sleep_clusters, esp_zb_basic_sleep_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    /* Create Analog Input cluster for sleep duration configuration (writable) */
+    float sleep_duration_float = (float)sleep_duration_seconds;  // Convert to float for analog input
+    esp_zb_analog_input_cluster_cfg_t sleep_analog_cfg = {
+        .present_value = sleep_duration_float,
+    };
+    esp_zb_attribute_list_t *esp_zb_sleep_analog_cluster = esp_zb_analog_input_cluster_create(&sleep_analog_cfg);
+    
+    /* Add description attribute */
+    char sleep_description[] = "\x14""Sleep Duration (sec)";  // Length-prefixed: 20 bytes + "Sleep Duration (sec)"
+    esp_zb_analog_input_cluster_add_attr(esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, sleep_description);
+    
+    /* Add engineering units attribute (seconds) */
+    uint16_t time_units = 73;  // Engineering units code for seconds
+    esp_zb_analog_input_cluster_add_attr(esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_ENGINEERING_UNITS_ID, &time_units);
+    
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_analog_input_cluster(esp_zb_sleep_clusters, esp_zb_sleep_analog_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    /* Add Identify cluster for sleep config endpoint */
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(esp_zb_sleep_clusters, esp_zb_identify_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    esp_zb_endpoint_config_t endpoint_sleep_config = {
+        .endpoint = HA_ESP_SLEEP_CONFIG_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0
+    };
+    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_sleep_clusters, endpoint_sleep_config);
+
     /* Add manufacturer info to all endpoints */
     zcl_basic_manufacturer_info_t info = {
         .manufacturer_name = ESP_MANUFACTURER_NAME,
@@ -385,6 +512,7 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_BME280_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_RAIN_GAUGE_ENDPOINT, &info);
+    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_SLEEP_CONFIG_ENDPOINT, &info);
 
     /* Add OTA cluster to BME280 endpoint for firmware updates */
     esp_zb_ota_cluster_cfg_t ota_cluster_cfg = {
@@ -397,14 +525,23 @@ static void esp_zb_task(void *pvParameters)
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
+    ESP_LOGI(TAG, "[CFG] Setting Zigbee channel mask: 0x%08lX", (unsigned long)ESP_ZB_PRIMARY_CHANNEL_MASK);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
     
     /* Start BME280 periodic reading (initial delay 5 seconds) */
     esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 5000);
     
-    /* Schedule deep sleep entry after allowing time for Zigbee operations */
-    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 10000); // 10 seconds
+    /* Schedule deep sleep entry - but only after network connection or extended timeout */
+    if (zigbee_network_connected) {
+        /* Already connected, can sleep normally after initial operations */
+        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 10000); // 10 seconds
+    } else {
+        /* Not connected yet, wait longer for join process and retry connection attempts */
+        ESP_LOGI(TAG, "📡 Network not connected, extending wake time for join process (60 seconds)");
+        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 60000); // 60 seconds for join
+        deep_sleep_scheduled = true;
+    }
     
     /* Note: Button monitoring is now interrupt-based, no polling task needed */
     
@@ -768,6 +905,61 @@ static void rain_gauge_zigbee_update(uint8_t param)
     }
 }
 
+/* Sleep configuration functions */
+static esp_err_t sleep_config_load(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(SLEEP_CONFIG_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGI(SLEEP_CONFIG_TAG, "No previous sleep configuration found, using default %d seconds", sleep_duration_seconds);
+        return ESP_OK;
+    }
+
+    size_t required_size = sizeof(uint32_t);
+    err = nvs_get_blob(nvs_handle, SLEEP_CONFIG_NVS_KEY, &sleep_duration_seconds, &required_size);
+    if (err == ESP_OK) {
+        // Validate range: 60 seconds (1 minute) to 7200 seconds (2 hours)
+        if (sleep_duration_seconds < 60) {
+            ESP_LOGW(SLEEP_CONFIG_TAG, "Sleep duration too short (%d), setting to minimum 60 seconds", sleep_duration_seconds);
+            sleep_duration_seconds = 60;
+        } else if (sleep_duration_seconds > 7200) {
+            ESP_LOGW(SLEEP_CONFIG_TAG, "Sleep duration too long (%d), setting to maximum 7200 seconds", sleep_duration_seconds);
+            sleep_duration_seconds = 7200;
+        }
+        ESP_LOGI(SLEEP_CONFIG_TAG, "📂 Loaded sleep duration: %d seconds (%.1f minutes)", 
+                 sleep_duration_seconds, sleep_duration_seconds / 60.0f);
+    } else {
+        ESP_LOGI(SLEEP_CONFIG_TAG, "No sleep configuration found, using default %d seconds", sleep_duration_seconds);
+    }
+
+    nvs_close(nvs_handle);
+    return ESP_OK;
+}
+
+static esp_err_t sleep_config_save(void)
+{
+    nvs_handle_t nvs_handle;
+    esp_err_t err = nvs_open(SLEEP_CONFIG_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(SLEEP_CONFIG_TAG, "Failed to open NVS for sleep config: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    err = nvs_set_blob(nvs_handle, SLEEP_CONFIG_NVS_KEY, &sleep_duration_seconds, sizeof(uint32_t));
+    if (err == ESP_OK) {
+        err = nvs_commit(nvs_handle);
+        if (err == ESP_OK) {
+            ESP_LOGI(SLEEP_CONFIG_TAG, "💾 Sleep duration saved: %d seconds (%.1f minutes)", 
+                     sleep_duration_seconds, sleep_duration_seconds / 60.0f);
+        }
+    } else {
+        ESP_LOGE(SLEEP_CONFIG_TAG, "Failed to save sleep duration: %s", esp_err_to_name(err));
+    }
+
+    nvs_close(nvs_handle);
+    return err;
+}
+
 static void rain_gauge_init(void)
 {
     ESP_LOGI(RAIN_TAG, "Initializing rain gauge on GPIO%d (disabled until network connection)", RAIN_GAUGE_GPIO);
@@ -870,11 +1062,26 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     
     /* Start Zigbee task */
-    ESP_LOGI(TAG, "🚀 Starting Zigbee Weather Station (Battery Mode)");
+    ESP_LOGI(TAG, "🚀 Starting Caelum Weather Station (Battery Mode)");
+    ESP_LOGI(TAG, "📦 Firmware: %s (Build: %s)", FIRMWARE_VERSION_STRING, 
+#ifdef FW_DATE_CODE
+             FW_DATE_CODE
+#else
+             "unknown"
+#endif
+    );
+    ESP_LOGI(TAG, "⚙️  OTA: Manufacturer=0x%04X, ImageType=0x%04X", OTA_UPGRADE_MANUFACTURER, OTA_UPGRADE_IMAGE_TYPE);
     ESP_LOGI(TAG, "Wake reason: %s", 
              wake_reason == WAKE_REASON_TIMER ? "TIMER" :
              wake_reason == WAKE_REASON_RAIN ? "RAIN" :
              wake_reason == WAKE_REASON_BUTTON ? "BUTTON" : "RESET");
+    
+    /* Log network connection status */
+    if (zigbee_network_connected) {
+        ESP_LOGI(TAG, "📡 Network: Connected");
+    } else {
+        ESP_LOGW(TAG, "📡 Network: Disconnected (retries: %d/%d)", connection_retry_count, MAX_CONNECTION_RETRIES);
+    }
     
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
 }

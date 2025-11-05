@@ -3,7 +3,7 @@
 | Supported Targets | ESP32-C6 | ESP32-H2 |
 | ----------------- |  -------- | -------- |
 
-# Zigbee Weather Station
+# Caelum - Zigbee Weather Station
 
 [![License: GPL v3](https://img.shields.io/badge/Software-GPLv3-blue.svg)](./LICENSE)
 [![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/Hardware-CC%20BY--NC--SA%204.0-green.svg)](./LICENSE-hardware)
@@ -30,7 +30,7 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 
 #### **Endpoint 1: Environmental Monitoring**
 - **Hardware**: BME280 sensor via I2C
-  - **ESP32-H2**: SDA: GPIO1, SCL: GPIO2
+  - **ESP32-H2**: SDA: GPIO10, SCL: GPIO11
   - **ESP32-C6**: SDA: GPIO6, SCL: GPIO7
 - **Measurements**: 
   - 🌡️ **Temperature**: -40°C to +85°C (±1°C accuracy)
@@ -42,14 +42,14 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 #### **Endpoint 2: Rain Gauge System**
 - **Hardware**: Tipping bucket rain gauge with reed switch
   - **ESP32-H2**: GPIO12 (RTC-capable for sleep wake-up)
-  - **ESP32-C6**: GPIO18 (timer wake-up only)
+  - **ESP32-C6**: GPIO5 (RTC-capable for sleep wake-up)
 - **Measurements**: Cumulative rainfall in millimeters (0.36mm per tip)
 - **Features**: 
   - Advanced debouncing (200ms + 1000ms bounce settle)
   - Persistent storage (NVS) for total tracking
   - Smart reporting (1mm threshold OR hourly)
   - Network-aware operation (only active when connected)
-  - ESP32-H2: Wake from deep sleep on rain detection
+  - **Both targets**: Wake from deep sleep on rain detection
 - **Specifications**: 
   - Maximum rate: 200mm/hour supported
   - Accuracy: ±0.36mm per bucket tip
@@ -68,22 +68,21 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 
 **ESP32-H2 (Recommended)**
 ```
-GPIO 1  - I2C SDA (BME280)
-GPIO 2  - I2C SCL (BME280) 
-GPIO 9  - Built-in button (factory reset)
+GPIO 10 - I2C SDA (BME280)
+GPIO 11 - I2C SCL (BME280) 
 GPIO 12 - Rain gauge input (RTC-capable)*
+GPIO 9  - Built-in button (factory reset)
 ```
 
 **ESP32-C6**
 ```
+GPIO 5  - Rain gauge input (RTC-capable)*
 GPIO 6  - I2C SDA (BME280)
 GPIO 7  - I2C SCL (BME280) 
 GPIO 9  - Built-in button (factory reset)
-GPIO 18 - Rain gauge input (timer wake-up only)**
 ```
 
-*ESP32-H2: GPIO12 is RTC-capable, enabling rain detection during deep sleep  
-**ESP32-C6: GPIO18 is not RTC-capable, rain detection limited to timer wake-ups
+*Both targets now use RTC-capable GPIO pins for rain detection during deep sleep
 
 ### � Zigbee Integration
 - **Protocol**: Zigbee 3.0  
@@ -93,14 +92,19 @@ GPIO 18 - Rain gauge input (timer wake-up only)**
 - **OTA Support**: Over-the-air firmware updates enabled (see [OTA_GUIDE.md](OTA_GUIDE.md))
 
 ### ⚡ Power Management
-- **Deep Sleep Mode**: 15-minute wake intervals for battery operation
+- **Deep Sleep Mode**: Adaptive intervals based on network connection
+  - **Connected**: 15-minute intervals (configurable via Zigbee2MQTT)
+  - **Disconnected**: 30-second intervals for quick reconnection
+  - **Max retries**: After 20 attempts (10 minutes), reduces to 7.5-minute intervals
 - **Wake-up Sources**:
-  - Timer (15 minutes for periodic updates)
-  - **ESP32-H2**: Rain detection during deep sleep (GPIO12 RTC-capable)
-  - **ESP32-C6**: Rain detection limited to timer wake-ups (GPIO18 not RTC-capable)
+  - Timer (adaptive based on network status)
+  - **Rain detection during deep sleep** (both targets support RTC wake-up)
+    - **ESP32-H2**: GPIO12 (RTC-capable)
+    - **ESP32-C6**: GPIO5 (RTC-capable)
+- **Network Retry Logic**: Prevents deep sleep when not connected to ensure reliable pairing
 - **Battery Life**: Optimized for extended operation on battery power
 - **Power Consumption**: ~100mA active, 7-10µA in deep sleep
-- **Battery Estimate**: 3+ years with 2500mAh battery on ESP32-H2
+- **Battery Estimate**: 3+ years with 2500mAh battery (when connected)
 
 ## 🚀 Quick Start
 
@@ -247,12 +251,13 @@ WeatherStation/
 
 #### **Rain Gauge Not Detecting**
 - **ESP32-H2**: Verify GPIO12 connections and reed switch operation
-- **ESP32-C6**: Verify GPIO18 connections (rain detection during timer wake-ups only)
+- **ESP32-C6**: Verify GPIO5 connections and reed switch operation
 - Check that device is connected to Zigbee network (rain gauge only active when connected)
 - Ensure proper pull-down resistor on rain gauge input
+- Both targets support rain detection during deep sleep
 
 #### **BME280 Not Reading**  
-- **ESP32-H2**: Check I2C connections (SDA: GPIO1, SCL: GPIO2)
+- **ESP32-H2**: Check I2C connections (SDA: GPIO10, SCL: GPIO11)
 - **ESP32-C6**: Check I2C connections (SDA: GPIO6, SCL: GPIO7)
 - Verify BME280 I2C address (default: 0x76 or 0x77)
 - Ensure proper power supply to sensor (3.3V)
@@ -261,11 +266,20 @@ WeatherStation/
 - Perform factory reset with long press (5s) on built-in button
 - Ensure Zigbee coordinator is in pairing mode
 - Check channel compatibility between coordinator and device
+- **Auto-retry**: Device automatically retries every 30 seconds when disconnected
+- **Battery impact**: Extended connection attempts may drain battery faster
 
 #### **Device Not Waking from Sleep**
 - Check battery voltage (minimum 3.0V recommended)
 - Verify wake-up sources (timer, rain gauge)
 - Review sleep manager logs for errors
+- **Network dependency**: Device stays awake longer when not connected to network
+
+#### **High Battery Drain**
+- Check if device is stuck in connection retry mode (30-second intervals)
+- Verify Zigbee network is stable and accessible
+- Monitor connection retry count in device logs
+- Consider factory reset if connection issues persist
 
 ### 📋 Development Notes
 
@@ -274,7 +288,7 @@ WeatherStation/
 - **Memory Usage**: ~2MB flash, ~200KB RAM typical
 - **Power Consumption**: ~100mA active, 7-10µA in deep sleep
 - **Battery Operation**: Optimized for CR123A or Li-ion battery packs
-- **Target Recommendation**: ESP32-H2 preferred for RTC GPIO wake-up capabilities
+- **Target Support**: Both ESP32-H2 and ESP32-C6 fully support RTC GPIO wake-up for rain detection
 
 ## 🔄 OTA Updates
 

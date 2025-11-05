@@ -21,6 +21,7 @@
 #define ED_KEEP_ALIVE                   15000                                /* 15000 millisecond - poll parent every 15s */
 #define HA_ESP_BME280_ENDPOINT          1                                    /* esp BME280 environmental sensor endpoint */
 #define HA_ESP_RAIN_GAUGE_ENDPOINT      2                                    /* esp rain gauge sensor endpoint */
+#define HA_ESP_SLEEP_CONFIG_ENDPOINT    3                                    /* esp sleep configuration endpoint */
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
 
 /* Deep sleep configuration for battery operation */
@@ -29,13 +30,20 @@
 #ifdef CONFIG_IDF_TARGET_ESP32H2
 #define RAIN_WAKE_GPIO                  GPIO_NUM_12                          /* GPIO for rain gauge wake-up (RTC-capable on ESP32-H2) */
 #else
-#define RAIN_WAKE_GPIO                  GPIO_NUM_18                          /* GPIO for rain gauge wake-up */
+#define RAIN_WAKE_GPIO                  GPIO_NUM_5                           /* GPIO for rain gauge wake-up (RTC-capable on ESP32-C6) */
 #endif
 #define RAIN_MM_THRESHOLD               1.0f                                 /* Wake up immediately if rain > 1mm */
 
-/* Basic manufacturer information */
+/* Basic manufacturer information - now using CMakeLists.txt definitions */
 #define ESP_MANUFACTURER_NAME "\x09""ESPRESSIF"      /* Customized manufacturer name */
-#define ESP_MODEL_IDENTIFIER "\x07"CONFIG_IDF_TARGET /* Customized model identifier */
+#define ESP_MODEL_IDENTIFIER "\x06""caelum"          /* Customized model identifier matching CMakeLists.txt project name */
+
+/* Firmware version information */
+#ifdef FW_VERSION
+#define FIRMWARE_VERSION_STRING         FW_VERSION                           /* From CMakeLists.txt */
+#else
+#define FIRMWARE_VERSION_STRING         "0.1.0"                              /* Default version */
+#endif
 
 #define ESP_ZB_ZED_CONFIG()                                         \
     {                                                               \

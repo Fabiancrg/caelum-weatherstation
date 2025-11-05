@@ -9,9 +9,18 @@
 #include "esp_err.h"
 #include "esp_zigbee_core.h"
 
-// OTA manufacturer and image type definitions
-#define OTA_UPGRADE_MANUFACTURER  0xFABC    // DIY manufacturer code
-#define OTA_UPGRADE_IMAGE_TYPE    0x1000
+// OTA manufacturer and image type definitions - now using CMakeLists.txt definitions
+#ifndef OTA_MANUFACTURER
+#define OTA_UPGRADE_MANUFACTURER  0xFABC    // Default DIY manufacturer code
+#else
+#define OTA_UPGRADE_MANUFACTURER  OTA_MANUFACTURER    // From CMakeLists.txt
+#endif
+
+#ifndef OTA_IMAGE_TYPE
+#define OTA_UPGRADE_IMAGE_TYPE    0x1200    // Default image type
+#else
+#define OTA_UPGRADE_IMAGE_TYPE    OTA_IMAGE_TYPE    // From CMakeLists.txt
+#endif
 
 #ifdef __cplusplus
 extern "C" {

@@ -79,9 +79,10 @@ uint32_t estimate_battery_life(uint32_t battery_mah);
  * @brief Get adaptive sleep duration based on recent rainfall
  * 
  * @param recent_rainfall_mm Recent rainfall amount
+ * @param base_duration_seconds Base sleep duration in seconds (configurable)
  * @return Sleep duration in seconds
  */
-uint32_t get_adaptive_sleep_duration(float recent_rainfall_mm);
+uint32_t get_adaptive_sleep_duration(float recent_rainfall_mm, uint32_t base_duration_seconds);
 
 /**
  * @brief Print wake-up statistics and power information
