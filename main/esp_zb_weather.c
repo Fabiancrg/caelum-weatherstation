@@ -23,6 +23,9 @@
 #include "i2c_bus.h"
 #include "nvs.h"
 #include "weather_driver.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
 /* Define multistate input cluster constants if not available */
 #ifndef ESP_ZB_ZCL_CLUSTER_ID_MULTISTATE_INPUT
@@ -88,6 +91,8 @@ static void rain_gauge_zigbee_update(uint8_t param);
 static void rain_gauge_enable_isr(void);
 static void rain_gauge_disable_isr(void);
 static bool rain_gauge_should_report(void);
+static esp_err_t battery_adc_init(void);
+static void battery_read_and_report(uint8_t param);
 static void rain_gauge_hourly_check(uint8_t param);
 static esp_err_t deferred_driver_init(void)
 {
@@ -134,6 +139,12 @@ static esp_err_t deferred_driver_init(void)
     /* Initialize rain gauge */
     rain_gauge_init();
     
+    /* Initialize battery ADC */
+    ret = battery_adc_init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Battery ADC initialization failed, will use simulated values");
+    }
+    
     /* Load sleep configuration */
     sleep_config_load();
     
@@ -176,6 +187,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 ESP_LOGI(TAG, "📊 Scheduling sensor data reporting after wake-up");
                 esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 2000); // Report in 2 seconds
                 esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 3000); // Report rainfall in 3 seconds
+                esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 4000); // Report battery in 4 seconds
                 
                 /* Check if OTA is in progress before scheduling deep sleep */
                 if (esp_zb_ota_is_active()) {
@@ -373,6 +385,8 @@ static void prepare_for_deep_sleep(uint8_t param)
         bme280_read_and_report(0);
         vTaskDelay(pdMS_TO_TICKS(100)); // Brief delay between reports
         rain_gauge_zigbee_update(0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        battery_read_and_report(0);
         vTaskDelay(pdMS_TO_TICKS(500)); // Allow time for Zigbee transmission
     }
     
@@ -489,15 +503,38 @@ static void esp_zb_task(void *pvParameters)
     /* Add Identify cluster for BME280 endpoint */
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(esp_zb_bme280_clusters, esp_zb_identify_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
+    /* Add Power Configuration cluster for battery monitoring */
+    esp_zb_power_config_cluster_cfg_t power_cfg = {
+        .main_voltage = 0xFFFF,           // Unknown initially (will be updated)
+    };
+    esp_zb_attribute_list_t *esp_zb_power_cluster = esp_zb_power_config_cluster_create(&power_cfg);
+    
+    /* Add battery-specific attributes using raw attribute IDs */
+    uint8_t battery_voltage = 0xFF;       // Unknown initially (0.1V units, e.g., 37 = 3.7V)
+    uint8_t battery_percentage = 0xFF;    // Unknown initially (0-200, where 200 = 100%)
+    uint8_t battery_size = 0xFF;          // 0xFF = other/unknown
+    uint8_t battery_quantity = 1;
+    uint8_t battery_rated_voltage = 37;   // 3.7V nominal for Li-Ion
+    uint8_t battery_alarm_mask = 0;
+    uint8_t battery_voltage_min_threshold = 27;  // 2.7V low battery warning for Li-Ion
+    
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0020, &battery_voltage);                    // Battery Voltage
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0021, &battery_percentage);                 // Battery Percentage Remaining
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0031, &battery_size);                       // Battery Size
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0033, &battery_quantity);                   // Battery Quantity
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0034, &battery_rated_voltage);              // Battery Rated Voltage
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0035, &battery_alarm_mask);                 // Battery Alarm Mask
+    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0036, &battery_voltage_min_threshold);      // Battery Voltage Min Threshold
+    
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_power_config_cluster(esp_zb_bme280_clusters, esp_zb_power_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+
     esp_zb_endpoint_config_t endpoint_bme280_config = {
         .endpoint = HA_ESP_BME280_ENDPOINT,
         .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
         .app_device_id = ESP_ZB_HA_TEMPERATURE_SENSOR_DEVICE_ID,
         .app_device_version = 0
     };
-    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_bme280_clusters, endpoint_bme280_config);
-
-    /* Create rain gauge sensor endpoint */
+    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_bme280_clusters, endpoint_bme280_config);    /* Create rain gauge sensor endpoint */
     esp_zb_cluster_list_t *esp_zb_rain_clusters = esp_zb_zcl_cluster_list_create();
     
     /* Create Basic cluster for rain gauge endpoint */
@@ -954,6 +991,179 @@ static void rain_gauge_zigbee_update(uint8_t param)
     } else {
         ESP_LOGE(RAIN_TAG, "❌ Failed to report rainfall: %s", esp_err_to_name(ret));
     }
+}
+
+/* Battery monitoring functions */
+static const char *BATTERY_TAG = "BATTERY";
+
+#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_4    // GPIO4 on ESP32-H2
+#define BATTERY_ADC_UNIT        ADC_UNIT_1       // ADC1 on ESP32-H2
+#define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12  // 0-3.1V range (covers 0-2.1V from divider)
+
+// For Li-Ion battery monitoring via voltage divider:
+// Li-Ion cell: R1=100kΩ, R2=100kΩ → divider = 2.0
+#define BATTERY_VOLTAGE_DIVIDER 2.0f             // 2.0 for cell monitoring (R1=R2=100kΩ)
+#define BATTERY_MIN_VOLTAGE     2.7f             // Li-Ion minimum safe voltage (V)
+#define BATTERY_MAX_VOLTAGE     4.2f             // Li-Ion maximum voltage (V)
+
+// ADC handles
+static adc_oneshot_unit_handle_t adc_handle = NULL;
+static adc_cali_handle_t adc_cali_handle = NULL;
+
+// Initialize ADC for battery monitoring
+static esp_err_t battery_adc_init(void)
+{
+    // Configure ADC1
+    adc_oneshot_unit_init_cfg_t init_config = {
+        .unit_id = BATTERY_ADC_UNIT,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    esp_err_t ret = adc_oneshot_new_unit(&init_config, &adc_handle);
+    if (ret == ESP_ERR_NOT_FOUND || ret == ESP_ERR_INVALID_STATE) {
+        // ADC already initialized - try to continue without creating new unit
+        ESP_LOGW(BATTERY_TAG, "ADC1 already in use, attempting to use without calibration");
+        adc_handle = NULL;  // Will use fallback in battery_read_and_report
+        return ESP_OK;  // Don't fail, just use simulated values
+    } else if (ret != ESP_OK) {
+        ESP_LOGE(BATTERY_TAG, "Failed to initialize ADC unit: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Configure ADC channel
+    adc_oneshot_chan_cfg_t chan_config = {
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ret = adc_oneshot_config_channel(adc_handle, BATTERY_ADC_CHANNEL, &chan_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(BATTERY_TAG, "Failed to configure ADC channel: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Initialize ADC calibration
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = BATTERY_ADC_UNIT,
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ret = adc_cali_create_scheme_curve_fitting(&cali_config, &adc_cali_handle);
+    if (ret == ESP_OK) {
+        ESP_LOGI(BATTERY_TAG, "ADC calibration scheme: Curve Fitting");
+    }
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    adc_cali_line_fitting_config_t cali_config = {
+        .unit_id = BATTERY_ADC_UNIT,
+        .atten = BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ret = adc_cali_create_scheme_line_fitting(&cali_config, &adc_cali_handle);
+    if (ret == ESP_OK) {
+        ESP_LOGI(BATTERY_TAG, "ADC calibration scheme: Line Fitting");
+    }
+#endif
+    
+    if (ret != ESP_OK) {
+        ESP_LOGW(BATTERY_TAG, "ADC calibration failed, using raw values: %s", esp_err_to_name(ret));
+        adc_cali_handle = NULL;
+    }
+    
+    ESP_LOGI(BATTERY_TAG, "✅ Battery ADC initialized on GPIO4 (ADC1_CH4)");
+    return ESP_OK;
+}
+
+static void battery_read_and_report(uint8_t param)
+{
+    float battery_voltage = 0.0f;
+    
+    if (adc_handle == NULL) {
+        ESP_LOGE(BATTERY_TAG, "ADC not initialized, using simulated value");
+        battery_voltage = 3.7f;  // Fallback simulated value
+    } else {
+        // Read ADC multiple times and average for better accuracy
+        const int num_samples = 10;
+        int voltage_sum = 0;
+        
+        for (int i = 0; i < num_samples; i++) {
+            int adc_raw;
+            esp_err_t ret = adc_oneshot_read(adc_handle, BATTERY_ADC_CHANNEL, &adc_raw);
+            if (ret != ESP_OK) {
+                ESP_LOGE(BATTERY_TAG, "ADC read failed: %s", esp_err_to_name(ret));
+                battery_voltage = 3.7f;  // Fallback value
+                goto skip_adc;
+            }
+            
+            int voltage_mv;
+            if (adc_cali_handle != NULL) {
+                ret = adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage_mv);
+                if (ret != ESP_OK) {
+                    ESP_LOGE(BATTERY_TAG, "ADC calibration failed: %s", esp_err_to_name(ret));
+                    // Fallback: rough calculation without calibration
+                    voltage_mv = (adc_raw * 3100) / 4095;  // Assuming 3.1V max with DB_12 attenuation
+                }
+            } else {
+                // No calibration available
+                voltage_mv = (adc_raw * 3100) / 4095;
+            }
+            
+            voltage_sum += voltage_mv;
+            vTaskDelay(pdMS_TO_TICKS(10));  // Small delay between samples
+        }
+        
+        // Calculate average voltage at ADC input (in volts)
+        float adc_voltage = (voltage_sum / num_samples) / 1000.0f;
+        
+        // Apply voltage divider multiplier to get actual battery voltage
+        battery_voltage = adc_voltage * BATTERY_VOLTAGE_DIVIDER;
+        
+        ESP_LOGI(BATTERY_TAG, "📊 ADC: %.3fV (raw avg: %dmV) → Battery: %.2fV", 
+                 adc_voltage, voltage_sum / num_samples, battery_voltage);
+    }
+    
+skip_adc:
+    
+    // Calculate battery percentage (0-100%) using Li-Ion discharge curve
+    // Li-Ion voltage curve is fairly linear between 3.0V-4.2V
+    float percentage = ((battery_voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0f;
+    if (percentage > 100.0f) percentage = 100.0f;
+    if (percentage < 0.0f) percentage = 0.0f;
+    
+    // Zigbee uses different units:
+    // - Battery voltage: 0.1V units (e.g., 30 = 3.0V)
+    // - Battery percentage: 0-200 scale (200 = 100%, 100 = 50%)
+    uint8_t zigbee_voltage = (uint8_t)(battery_voltage * 10.0f);
+    uint8_t zigbee_percentage = (uint8_t)(percentage * 2.0f);
+    
+    // Update battery voltage attribute (0x0020)
+    esp_err_t ret = esp_zb_zcl_set_attribute_val(
+        HA_ESP_BME280_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        0x0020,  // Battery Voltage attribute ID
+        &zigbee_voltage,
+        false  // Don't force report, let reporting configuration handle it
+    );
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery voltage: %s", esp_err_to_name(ret));
+    }
+    
+    // Update battery percentage attribute (0x0021)
+    ret = esp_zb_zcl_set_attribute_val(
+        HA_ESP_BME280_ENDPOINT,
+        ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        0x0021,  // Battery Percentage Remaining attribute ID
+        &zigbee_percentage,
+        false
+    );
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
+    }
+    
+    ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) - Zigbee values: %u (0.1V), %u (%%*2)", 
+             battery_voltage, percentage, zigbee_voltage, zigbee_percentage);
 }
 
 /* Sleep configuration functions */

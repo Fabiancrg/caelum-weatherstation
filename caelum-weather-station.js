@@ -26,6 +26,7 @@ export default {
         m.temperature(),
         m.humidity(),
         m.pressure(),
+        m.battery(),  // Add battery monitoring
         m.numeric({
             "name": "rainfall",
             "cluster": "genAnalogInput",
