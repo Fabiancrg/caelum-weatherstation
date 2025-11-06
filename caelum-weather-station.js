@@ -1,5 +1,5 @@
 
-import * as m from 'zigbee-herdsman-converters/lib/modernExtend';
+const m = require('zigbee-herdsman-converters/lib/modernExtend');
 
 const fzRainfall = {
     cluster: 'genAnalogInput',
@@ -16,7 +16,7 @@ const fzRainfall = {
     },
 };
 
-export default {
+module.exports = {
     zigbeeModel: ['caelum'],
     model: 'caelum',
     vendor: 'ESPRESSIF',
