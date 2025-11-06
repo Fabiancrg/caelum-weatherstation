@@ -48,6 +48,13 @@ esp_zb_zcl_ota_upgrade_status_t esp_zb_ota_get_status(void);
 uint32_t esp_zb_ota_get_fw_version(void);
 
 /**
+ * @brief Check if OTA update is in progress or pending
+ * 
+ * @return true if OTA is active, false otherwise
+ */
+bool esp_zb_ota_is_active(void);
+
+/**
  * @brief OTA upgrade value callback handler
  * 
  * @param message OTA upgrade value message

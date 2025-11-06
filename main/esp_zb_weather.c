@@ -78,6 +78,7 @@ static void builtin_button_callback(button_action_t action);
 static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
 static void prepare_for_deep_sleep(uint8_t param);
+static void check_ota_status(uint8_t param);
 static esp_err_t sleep_config_load(void);
 static esp_err_t sleep_config_save(void);
 static void rain_gauge_init(void);
@@ -176,11 +177,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 2000); // Report in 2 seconds
                 esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 3000); // Report rainfall in 3 seconds
                 
-                /* Schedule deep sleep after reporting window */
-                if (!deep_sleep_scheduled) {
-                    ESP_LOGI(TAG, "⏰ Scheduling deep sleep after reporting window (15 seconds)");
-                    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000);
-                    deep_sleep_scheduled = true;
+                /* Check if OTA is in progress before scheduling deep sleep */
+                if (esp_zb_ota_is_active()) {
+                    ESP_LOGW(TAG, "🔄 OTA update in progress - staying awake, deep sleep disabled");
+                    deep_sleep_scheduled = false; // Don't schedule sleep during OTA
+                    /* Schedule periodic OTA status check */
+                    esp_zb_scheduler_alarm((esp_zb_callback_t)check_ota_status, 0, 5000); // Check every 5 seconds
+                } else {
+                    /* Schedule deep sleep after reporting window */
+                    if (!deep_sleep_scheduled) {
+                        ESP_LOGI(TAG, "⏰ Scheduling deep sleep after reporting window (15 seconds)");
+                        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000);
+                        deep_sleep_scheduled = true;
+                    }
                 }
             }
         } else {
@@ -210,11 +219,19 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             rain_gauge_enable_isr();
             ESP_LOGI(RAIN_TAG, "Rain gauge enabled - device connected to Zigbee network");
             
-            /* Now that we're connected, schedule normal deep sleep after allowing time for data reporting */
-            if (!deep_sleep_scheduled) {
-                ESP_LOGI(TAG, "📡 Network connected! Scheduling sleep after sensor data reporting (15 seconds)");
-                esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000); // 15 seconds for reporting
-                deep_sleep_scheduled = true;
+            /* Check if OTA is in progress before scheduling deep sleep */
+            if (esp_zb_ota_is_active()) {
+                ESP_LOGW(TAG, "🔄 OTA update in progress - staying awake, deep sleep disabled");
+                deep_sleep_scheduled = false; // Don't schedule sleep during OTA
+                /* Schedule periodic OTA status check */
+                esp_zb_scheduler_alarm((esp_zb_callback_t)check_ota_status, 0, 5000); // Check every 5 seconds
+            } else {
+                /* Now that we're connected, schedule normal deep sleep after allowing time for data reporting */
+                if (!deep_sleep_scheduled) {
+                    ESP_LOGI(TAG, "📡 Network connected! Scheduling sleep after sensor data reporting (15 seconds)");
+                    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000); // 15 seconds for reporting
+                    deep_sleep_scheduled = true;
+                }
             }
         } else {
             ESP_LOGI(TAG, "Network steering was not successful (status: %s)", esp_err_to_name(err_status));
@@ -402,6 +419,25 @@ static void prepare_for_deep_sleep(uint8_t param)
     enter_deep_sleep(sleep_duration, true);  // Enable rain detection wake-up
     
     /* Never reached - device will restart after wake-up */
+}
+
+/**
+ * @brief Check OTA status and reschedule deep sleep when OTA completes
+ */
+static void check_ota_status(uint8_t param)
+{
+    if (esp_zb_ota_is_active()) {
+        /* OTA still in progress - stay awake and check again in 5 seconds */
+        ESP_LOGI(TAG, "🔄 OTA update in progress, staying awake...");
+        esp_zb_scheduler_alarm((esp_zb_callback_t)check_ota_status, 0, 5000);
+    } else {
+        /* OTA completed or not active - schedule deep sleep */
+        ESP_LOGI(TAG, "✅ OTA check complete, scheduling deep sleep");
+        if (!deep_sleep_scheduled && zigbee_network_connected) {
+            esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 5000);
+            deep_sleep_scheduled = true;
+        }
+    }
 }
 
 static void esp_zb_task(void *pvParameters)
@@ -754,6 +790,9 @@ static void rain_gauge_task(void *arg)
                         rain_pulse_count++;
                         total_rainfall_mm += RAIN_MM_PER_PULSE;
                         
+                        // Round to 2 decimal places to avoid floating-point precision accumulation
+                        total_rainfall_mm = roundf(total_rainfall_mm * 100.0f) / 100.0f;
+                        
                         ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u detected! Total: %.2f mm (+%.2f mm)", 
                                  rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
                         
@@ -903,12 +942,15 @@ static void rain_gauge_hourly_check(uint8_t param)
 
 static void rain_gauge_zigbee_update(uint8_t param)
 {
+    // Round to 2 decimal places to avoid floating-point precision issues
+    float rounded_rainfall = roundf(total_rainfall_mm * 100.0f) / 100.0f;
+    
     esp_err_t ret = esp_zb_zcl_set_attribute_val(HA_ESP_RAIN_GAUGE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
                                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-                                                 &total_rainfall_mm, true);  // Force reporting
+                                                 &rounded_rainfall, true);  // Force reporting
     
     if (ret == ESP_OK) {
-        ESP_LOGI(RAIN_TAG, "✅ Rainfall total %.2f mm reported to Zigbee", total_rainfall_mm);
+        ESP_LOGI(RAIN_TAG, "✅ Rainfall total %.2f mm reported to Zigbee", rounded_rainfall);
     } else {
         ESP_LOGE(RAIN_TAG, "❌ Failed to report rainfall: %s", esp_err_to_name(ret));
     }
@@ -981,7 +1023,8 @@ static void rain_gauge_init(void)
     uint32_t loaded_pulses = 0;
     load_rainfall_data(&loaded_rainfall, &loaded_pulses);
     
-    total_rainfall_mm = loaded_rainfall;
+    // Round loaded value to 2 decimal places to avoid floating-point precision issues
+    total_rainfall_mm = roundf(loaded_rainfall * 100.0f) / 100.0f;
     rain_pulse_count = loaded_pulses;
     
     if (loaded_rainfall > 0.0f || loaded_pulses > 0) {

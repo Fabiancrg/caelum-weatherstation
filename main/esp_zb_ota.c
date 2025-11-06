@@ -282,3 +282,13 @@ uint32_t esp_zb_ota_get_fw_version(void)
     }
     return version;
 }
+
+/**
+ * @brief Check if OTA update is in progress or pending
+ */
+bool esp_zb_ota_is_active(void)
+{
+    return (ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START ||
+            ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE ||
+            ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY);
+}
