@@ -22,7 +22,17 @@
 #define HA_ESP_BME280_ENDPOINT          1                                    /* esp BME280 environmental sensor endpoint */
 #define HA_ESP_RAIN_GAUGE_ENDPOINT      2                                    /* esp rain gauge sensor endpoint */
 #define HA_ESP_SLEEP_CONFIG_ENDPOINT    3                                    /* esp sleep configuration endpoint */
+#define HA_ESP_LED_DEBUG_ENDPOINT       4                                    /* esp LED debug control endpoint (genOnOff) */
 #define ESP_ZB_PRIMARY_CHANNEL_MASK     ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK /* Zigbee primary channel mask use in the example */
+
+/* Debug LED configuration */
+#define DEBUG_LED_ENABLE                1                                    /* Set to 1 to enable LED debug indicator */
+#define DEBUG_LED_TYPE_RGB              1                                    /* Set to 1 for WS2812 RGB LED, 0 for simple GPIO */
+#ifdef CONFIG_IDF_TARGET_ESP32H2
+#define DEBUG_LED_GPIO                  GPIO_NUM_8                           /* Built-in RGB LED on ESP32-H2 SuperMini */
+#else
+#define DEBUG_LED_GPIO                  GPIO_NUM_8                           /* Adjust for your board */
+#endif
 
 /* Deep sleep configuration for battery operation */
 #define SLEEP_DURATION_MINUTES          15                                   /* Wake up every 15 minutes for periodic reporting */

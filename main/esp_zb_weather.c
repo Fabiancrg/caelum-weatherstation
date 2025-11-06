@@ -47,6 +47,197 @@
 static const char *TAG = "WEATHER_STATION";
 //static const char *RAIN_TAG = "RAIN_GAUGE";
 
+/* Network connection status - declared early for LED functions */
+static bool zigbee_network_connected = false;
+
+#ifdef DEBUG_LED_ENABLE
+/* LED debug control - can be toggled via Zigbee endpoint 4 */
+static bool led_debug_enabled = true;  // Default ON, can be controlled via genOnOff cluster
+
+#if DEBUG_LED_TYPE_RGB
+#include "led_strip.h"
+
+/* Debug LED variables for RGB LED */
+static led_strip_handle_t led_strip = NULL;
+static bool led_blink_task_running = false;
+static TaskHandle_t led_blink_task_handle = NULL;
+
+/* LED control functions for WS2812 RGB LED */
+static void debug_led_init(void)
+{
+    /* LED strip configuration for WS2812 (older API for led_strip ~2.0.0) */
+    led_strip_config_t strip_config = {
+        .strip_gpio_num = DEBUG_LED_GPIO,
+        .max_leds = 1,                         // Only 1 LED
+    };
+    
+    /* LED strip RMT configuration (older API) */
+    led_strip_rmt_config_t rmt_config = {
+        .resolution_hz = 10 * 1000 * 1000,     // 10MHz
+    };
+    
+    ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &led_strip));
+    
+    /* Turn off LED initially */
+    led_strip_clear(led_strip);
+    ESP_LOGI(TAG, "Debug RGB LED initialized on GPIO%d (WS2812)", DEBUG_LED_GPIO);
+}
+
+static void debug_led_set(bool state)
+{
+    if (!led_debug_enabled) {
+        led_strip_clear(led_strip);
+        return;
+    }
+    
+    if (state) {
+        /* Blue color for connected state */
+        led_strip_set_pixel(led_strip, 0, 0, 0, 16);  // R=0, G=0, B=16 (dim blue)
+    } else {
+        /* Off */
+        led_strip_set_pixel(led_strip, 0, 0, 0, 0);
+    }
+    led_strip_refresh(led_strip);
+}
+
+static void debug_led_blink_task(void *arg)
+{
+    while (led_blink_task_running) {
+        /* Yellow blink for network joining */
+        led_strip_set_pixel(led_strip, 0, 16, 8, 0);  // R=16, G=8, B=0 (dim yellow/orange)
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(500));  // ON for 500ms
+        
+        led_strip_set_pixel(led_strip, 0, 0, 0, 0);   // OFF
+        led_strip_refresh(led_strip);
+        vTaskDelay(pdMS_TO_TICKS(500));  // OFF for 500ms
+    }
+    vTaskDelete(NULL);
+}
+
+static void debug_led_start_blink(void)
+{
+    if (!led_debug_enabled) return;
+    
+    if (!led_blink_task_running) {
+        led_blink_task_running = true;
+        xTaskCreate(debug_led_blink_task, "led_blink", 2048, NULL, 5, &led_blink_task_handle);
+        ESP_LOGI(TAG, "RGB LED blink started (network joining)");
+    }
+}
+
+static void debug_led_stop_blink(void)
+{
+    if (led_blink_task_running) {
+        led_blink_task_running = false;
+        if (led_blink_task_handle) {
+            vTaskDelay(pdMS_TO_TICKS(10));  // Give task time to exit
+            led_blink_task_handle = NULL;
+        }
+    }
+}
+
+static void debug_led_rain_flash(void)
+{
+    if (!led_debug_enabled) return;
+    
+    /* Quick white flash for rain pulse (non-blocking) */
+    led_strip_set_pixel(led_strip, 0, 16, 16, 16);  // R=16, G=16, B=16 (dim white)
+    led_strip_refresh(led_strip);
+    vTaskDelay(pdMS_TO_TICKS(100));  // Flash for 100ms
+    
+    /* Return to previous state */
+    if (zigbee_network_connected) {
+        led_strip_set_pixel(led_strip, 0, 0, 0, 16);  // Back to blue (connected)
+    } else {
+        led_strip_set_pixel(led_strip, 0, 0, 0, 0);   // Back to off
+    }
+    led_strip_refresh(led_strip);
+}
+
+#else
+/* Debug LED variables for simple GPIO LED */
+static bool led_blink_task_running = false;
+static TaskHandle_t led_blink_task_handle = NULL;
+
+/* LED control functions */
+static void debug_led_init(void)
+{
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << DEBUG_LED_GPIO),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(DEBUG_LED_GPIO, 0);  // LED OFF initially
+    ESP_LOGI(TAG, "Debug LED initialized on GPIO%d", DEBUG_LED_GPIO);
+}
+
+static void debug_led_set(bool state)
+{
+    if (!led_debug_enabled) {
+        gpio_set_level(DEBUG_LED_GPIO, 0);
+        return;
+    }
+    gpio_set_level(DEBUG_LED_GPIO, state ? 1 : 0);
+}
+
+static void debug_led_blink_task(void *arg)
+{
+    while (led_blink_task_running) {
+        gpio_set_level(DEBUG_LED_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(500));  // ON for 500ms
+        gpio_set_level(DEBUG_LED_GPIO, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));  // OFF for 500ms
+    }
+    vTaskDelete(NULL);
+}
+
+static void debug_led_start_blink(void)
+{
+    if (!led_debug_enabled) return;
+    
+    if (!led_blink_task_running) {
+        led_blink_task_running = true;
+        xTaskCreate(debug_led_blink_task, "led_blink", 2048, NULL, 5, &led_blink_task_handle);
+        ESP_LOGI(TAG, "LED blink started (network joining)");
+    }
+}
+
+static void debug_led_stop_blink(void)
+{
+    if (led_blink_task_running) {
+        led_blink_task_running = false;
+        if (led_blink_task_handle) {
+            vTaskDelay(pdMS_TO_TICKS(10));  // Give task time to exit
+            led_blink_task_handle = NULL;
+        }
+    }
+}
+
+static void debug_led_rain_flash(void)
+{
+    if (!led_debug_enabled) return;
+    
+    /* Quick flash for rain pulse (simple GPIO) */
+    gpio_set_level(DEBUG_LED_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));  // Flash for 100ms
+    
+    /* Return to previous state */
+    gpio_set_level(DEBUG_LED_GPIO, zigbee_network_connected ? 1 : 0);
+}
+#endif /* DEBUG_LED_TYPE_RGB */
+#else
+/* Dummy functions when LED debug is disabled */
+static inline void debug_led_init(void) {}
+static inline void debug_led_set(bool state) {}
+static inline void debug_led_start_blink(void) {}
+static inline void debug_led_stop_blink(void) {}
+static inline void debug_led_rain_flash(void) {}
+#endif /* DEBUG_LED_ENABLE */
+
 /* Rain gauge configuration */
 #ifdef CONFIG_IDF_TARGET_ESP32H2
 #define RAIN_GAUGE_GPIO         12              // GPIO pin for rain gauge reed switch (RTC-capable on ESP32-H2)
@@ -72,8 +263,7 @@ static const char *SLEEP_CONFIG_TAG = "SLEEP_CONFIG";
 #define SLEEP_CONFIG_NVS_KEY            "duration_sec"
 #define SLEEP_CONFIG_ATTR_ID            0x8000  // Custom attribute ID for sleep duration
 
-/* Network connection status */
-static bool zigbee_network_connected = false;
+/* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 static bool deep_sleep_scheduled = false;  // Track if deep sleep has been scheduled
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
@@ -170,6 +360,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
     switch (sig_type) {
     case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
         ESP_LOGI(TAG, "Initialize Zigbee stack");
+        debug_led_start_blink();  // Start blinking when joining network
         esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
         break;
     case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
@@ -181,9 +372,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(TAG, "Device started up in %s factory-reset mode", esp_zb_bdb_is_factory_new() ? "" : "non");
             if (esp_zb_bdb_is_factory_new()) {
                 ESP_LOGI(TAG, "Start network steering");
+                debug_led_start_blink();  // Start blinking when joining network
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
                 ESP_LOGI(TAG, "Device rebooted - was previously connected");
+                debug_led_stop_blink();  // Stop blinking
+                debug_led_set(true);     // LED ON - connected
                 /* Device was previously paired - mark as connected and enable rain gauge */
                 zigbee_network_connected = true;
                 rain_gauge_enable_isr();
@@ -229,6 +423,9 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                      extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
                      extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0],
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(), esp_zb_get_short_address());
+            
+            debug_led_stop_blink();  // Stop blinking
+            debug_led_set(true);     // LED ON - connected
             
             /* Mark network as connected and reset retry count */
             zigbee_network_connected = true;
@@ -323,6 +520,32 @@ static esp_err_t zb_attribute_handler(const esp_zb_zcl_set_attr_value_message_t 
         }
     }
     
+    /* Handle LED debug control via On/Off cluster */
+    if (message->info.dst_endpoint == HA_ESP_LED_DEBUG_ENDPOINT && 
+        message->info.cluster == ESP_ZB_ZCL_CLUSTER_ID_ON_OFF &&
+        message->attribute.id == ESP_ZB_ZCL_ATTR_ON_OFF_ON_OFF_ID) {
+        
+        if (message->attribute.data.size == sizeof(bool)) {
+            bool new_state = *(bool*)message->attribute.data.value;
+            led_debug_enabled = new_state;
+            
+            /* Update the LED immediately based on new state and network status */
+            if (led_debug_enabled) {
+                /* Re-enable LED, set to current network state */
+                debug_led_set(zigbee_network_connected);
+            } else {
+                /* Disable LED - turn it off */
+                debug_led_stop_blink();
+                debug_led_set(false);
+            }
+            
+            ESP_LOGI(TAG, "💡 LED debug %s via Zigbee", led_debug_enabled ? "enabled" : "disabled");
+        } else {
+            ESP_LOGW(TAG, "Invalid data size for LED debug control: %d", message->attribute.data.size);
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+    }
+    
     return ret;
 }
 
@@ -400,6 +623,10 @@ static void prepare_for_deep_sleep(uint8_t param)
     }
     
     ESP_LOGI(TAG, "✅ Zigbee operations complete, preparing for deep sleep...");
+    
+    /* Turn off LED before sleep */
+    debug_led_stop_blink();
+    debug_led_set(false);
     
     /* Force final sensor reporting before sleep */
     if (zigbee_network_connected) {
@@ -714,6 +941,35 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_sleep_clusters, endpoint_sleep_config);
 
+    /* CREATE LED DEBUG CONTROL ENDPOINT */
+    esp_zb_cluster_list_t *esp_zb_led_clusters = esp_zb_zcl_cluster_list_create();
+    
+    /* Create Basic cluster for LED debug endpoint */
+    esp_zb_basic_cluster_cfg_t basic_led_cfg = {
+        .zcl_version = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_attribute_list_t *esp_zb_basic_led_cluster = esp_zb_basic_cluster_create(&basic_led_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(esp_zb_led_clusters, esp_zb_basic_led_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    /* Create On/Off cluster for LED debug control */
+    esp_zb_on_off_cluster_cfg_t onoff_cfg = {
+        .on_off = led_debug_enabled,  // Initial state matches current setting
+    };
+    esp_zb_attribute_list_t *esp_zb_onoff_cluster = esp_zb_on_off_cluster_create(&onoff_cfg);
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_on_off_cluster(esp_zb_led_clusters, esp_zb_onoff_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    /* Add Identify cluster for LED debug endpoint */
+    ESP_ERROR_CHECK(esp_zb_cluster_list_add_identify_cluster(esp_zb_led_clusters, esp_zb_identify_cluster_create(NULL), ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
+    
+    esp_zb_endpoint_config_t endpoint_led_config = {
+        .endpoint = HA_ESP_LED_DEBUG_ENDPOINT,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_ON_OFF_OUTPUT_DEVICE_ID,  // On/Off Output device
+        .app_device_version = 0
+    };
+    esp_zb_ep_list_add_ep(esp_zb_ep_list, esp_zb_led_clusters, endpoint_led_config);
+
     /* Add manufacturer info to all endpoints */
     zcl_basic_manufacturer_info_t info = {
         .manufacturer_name = ESP_MANUFACTURER_NAME,
@@ -722,6 +978,7 @@ static void esp_zb_task(void *pvParameters)
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_BME280_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_RAIN_GAUGE_ENDPOINT, &info);
     esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_SLEEP_CONFIG_ENDPOINT, &info);
+    esp_zcl_utility_add_ep_basic_manufacturer_info(esp_zb_ep_list, HA_ESP_LED_DEBUG_ENDPOINT, &info);
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
@@ -923,6 +1180,9 @@ static void rain_gauge_task(void *arg)
                         
                         // Round to 2 decimal places to avoid floating-point precision accumulation
                         total_rainfall_mm = roundf(total_rainfall_mm * 100.0f) / 100.0f;
+                        
+                        /* Flash LED white to indicate rain pulse detected */
+                        debug_led_rain_flash();
                         
                         ESP_LOGI(RAIN_TAG, "🌧️ Rain pulse #%u detected! Total: %.2f mm (+%.2f mm)", 
                                  rain_pulse_count, total_rainfall_mm, RAIN_MM_PER_PULSE);
@@ -1506,6 +1766,9 @@ void app_main(void)
 {
     /* Initialize NVS */
     ESP_ERROR_CHECK(nvs_flash_init());
+    
+    /* Initialize debug LED */
+    debug_led_init();
     
     /* Initialize OTA */
     ESP_ERROR_CHECK(esp_zb_ota_init());

@@ -23,9 +23,20 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 
 | Endpoint | Device Type | Clusters | Description |
 |----------|-------------|----------|-------------|
-| **1** | Environmental Sensor | Temperature, Humidity, Pressure | BME280 sensor via I2C |
+| **1** | Environmental Sensor | Temperature, Humidity, Pressure, Battery, OTA | BME280 sensor via I2C |
 | **2** | Rain Gauge | Analog Input | Tipping bucket rain sensor with rainfall totals |
 | **3** | Sleep Configuration | Analog Input | Remote sleep duration control (60-7200 seconds) |
+| **4** | LED Debug Control | On/Off | WS2812 RGB LED status indicator (remote control) |
+
+### 💡 LED Debug Feature (Optional)
+
+The device includes an optional WS2812 RGB LED on GPIO8 (ESP32-H2 SuperMini) that provides visual feedback:
+- **Blue (Steady)**: Connected to Zigbee network
+- **Orange (Blinking)**: Joining/searching for network  
+- **White (Brief Flash)**: Rain pulse detected
+- **Off**: Deep sleep or disabled via Zigbee
+
+This feature can be controlled remotely via Zigbee2MQTT (endpoint 4) and disabled to conserve battery. See [LED_DEBUG_FEATURE.md](LED_DEBUG_FEATURE.md) for complete documentation.
 
 ### 📋 Detailed Endpoint Descriptions
 
@@ -85,6 +96,27 @@ This project is based on the examples provided in the ESP Zigbee SDK:
   - Seasonal adjustments (frequent updates in rainy season)
   - Dynamic power management based on weather conditions
 
+#### **Endpoint 4: LED Debug Control**
+- **Hardware**: WS2812 RGB LED (ESP32-H2 SuperMini)
+  - **GPIO**: GPIO8
+  - **Driver**: espressif/led_strip ~2.0.0
+- **LED States**:
+  - 🔵 **Blue (Steady)**: Connected to Zigbee network
+  - 🟠 **Orange (Blinking)**: Searching/joining network
+  - ⚪ **White (Flash)**: Rain pulse detected (100ms)
+  - ⚫ **Off**: Deep sleep or disabled
+- **Control**: On/Off cluster for remote enable/disable
+- **Features**:
+  - Remote control via Zigbee2MQTT switch
+  - Default state: Enabled (ON)
+  - Minimal battery impact (~20mA when active, off during sleep)
+  - Visual feedback for debugging and network status
+- **Use Case**: 
+  - Development and testing (visual network status)
+  - Field deployment debugging
+  - Can be disabled remotely to conserve battery
+- **Documentation**: See [LED_DEBUG_FEATURE.md](LED_DEBUG_FEATURE.md) for details
+
 ### 🔧 Hardware Configuration
 
 #### **Required Components**
@@ -100,10 +132,11 @@ This project is based on the examples provided in the ESP Zigbee SDK:
 **ESP32-H2 (Recommended)**
 ```
 GPIO 4  - Battery voltage input (ADC1_CH4 with voltage divider)
+GPIO 8  - WS2812 RGB LED (debug indicator, optional)
+GPIO 9  - Built-in button (factory reset)
 GPIO 10 - I2C SDA (BME280)
 GPIO 11 - I2C SCL (BME280) 
 GPIO 12 - Rain gauge input (RTC-capable)*
-GPIO 9  - Built-in button (factory reset)
 ```
 
 **ESP32-C6**
@@ -269,6 +302,7 @@ When connected to Zigbee2MQTT or other Zigbee coordinators, the device appears a
 - **1x Sensor entity**: Battery Voltage (mV)
 - **1x Sensor entity**: Rainfall total with automatic updates
 - **1x Number entity**: Sleep duration control (60-7200 seconds)
+- **1x Switch entity**: LED debug control (enable/disable status indicator)
 
 ### Zigbee2MQTT Integration
 
@@ -316,14 +350,15 @@ Key parameters can be adjusted in `main/esp_zb_weather.h`:
 - **Battery monitoring interval**: 3600 seconds (1 hour) - time-based with NVS persistence
 - **Battery ADC samples**: 3 samples averaged (optimized from 10)
 - **Battery monitoring power**: ~12µAh/day (98% reduction from original ~480µAh/day)
+- **LED Debug**: Optional WS2812 RGB LED on GPIO8 (ESP32-H2), controllable via Zigbee
 
 ## 📝 Project Structure
 
 ```
 WeatherStation/
 ├── main/
-│   ├── esp_zb_weather.c     # Main Zigbee stack, 3-endpoint logic, network retry
-│   ├── esp_zb_weather.h     # Configuration, endpoint definitions
+│   ├── esp_zb_weather.c     # Main Zigbee stack, 4-endpoint logic, network retry, LED control
+│   ├── esp_zb_weather.h     # Configuration, endpoint definitions, LED settings
 │   ├── esp_zb_ota.c         # OTA update implementation
 │   ├── esp_zb_ota.h         # OTA interface
 │   ├── sleep_manager.c      # Deep sleep management with RTC GPIO support
@@ -334,12 +369,13 @@ WeatherStation/
 │   └── weather_driver.h     # DEPRECATED: Legacy interface (unused)
 ├── Doc/
 │   └── README_GIT.md        # Git workflow guide for team (Azure DevOps)
-├── caelum-weather-station.js # Zigbee2MQTT external converter
+├── caelum-weather-station.js # Zigbee2MQTT external converter (4 endpoints)
 ├── version.h.in             # Version header template (for configure_file)
 ├── CMakeLists.txt           # Build configuration with version generation
 ├── partitions.csv           # Partition table with OTA support
 ├── sdkconfig.defaults       # Default SDK settings
 ├── OTA_GUIDE.md            # OTA update instructions
+├── LED_DEBUG_FEATURE.md    # LED debug feature documentation
 └── README.md               # This file
 ```
 
@@ -395,6 +431,16 @@ WeatherStation/
 - Consider factory reset if connection issues persist
 - **Battery monitoring optimization**: Should consume only ~12µAh/day (hourly readings)
 - **Total optimized power**: ~230µAh/day → 10.9 year battery life (2500mAh battery)
+- **LED Debug**: If enabled, LED consumes ~20mA during wake cycles (can be disabled via Zigbee)
+
+#### **LED Not Working**
+- **ESP32-H2 SuperMini**: Verify GPIO8 connection to WS2812 RGB LED
+- Check LED debug feature is enabled in `esp_zb_weather.h` (`DEBUG_LED_ENABLE=1`)
+- Verify LED debug is enabled via Zigbee2MQTT switch (endpoint 4)
+- Monitor serial output for LED initialization messages
+- Ensure led_strip component (~2.0.0) is properly installed
+- **LED States**: Blue=connected, Orange blink=joining, White flash=rain, Off=sleep/disabled
+- See [LED_DEBUG_FEATURE.md](LED_DEBUG_FEATURE.md) for detailed troubleshooting
 
 ### 📋 Development Notes
 
@@ -427,11 +473,13 @@ This project follows dual licensing:
 
 ## 🔄 Based On
 
-This project is derived from ESP32 Zigbee SDK examples and implements a 3-endpoint architecture optimized for battery-powered weather station applications with:
+This project is derived from ESP32 Zigbee SDK examples and implements a 4-endpoint architecture optimized for battery-powered weather station applications with:
 - Remote sleep duration configuration (Endpoint 3)
+- LED debug status indicator with remote control (Endpoint 4)
 - Deep sleep power management with network retry logic
 - Extended wake time during Zigbee join process (60 seconds)
 - RTC GPIO wake-up support for rain detection on both ESP32-H2 and ESP32-C6
+- Optimized battery monitoring with 98% power reduction
 
 ## 🤝 Contributing
 
@@ -456,10 +504,12 @@ If you find this project useful, consider supporting the development:
 **Compatible**: ESP32-C6, ESP32-H2, ESP-IDF v5.5.1+  
 **License**: GPL v3 (Software) / CC BY-NC-SA 4.0 (Hardware)  
 **Features**: 
-- 3-endpoint design with remote sleep configuration
+- 4-endpoint design (sensors, rain, sleep config, LED debug)
+- Remote sleep configuration and LED control via Zigbee
 - OTA firmware updates
 - RTC GPIO wake-up for rain detection
 - Optimized battery monitoring (~98% power reduction)
 - Time-based hourly intervals with NVS persistence
+- WS2812 RGB LED status indicator (optional)
 - 10.9 year battery life (2500mAh, 15-min intervals)
 
