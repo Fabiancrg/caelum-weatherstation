@@ -1151,7 +1151,7 @@ static void rain_gauge_task(void *arg)
 {
     rain_evt_t evt;
     TickType_t last_pulse_time = 0;
-    TickType_t last_debug_time = 0;
+    //TickType_t last_debug_time = 0;
     const TickType_t DEBOUNCE_TIME = pdMS_TO_TICKS(200); // 200ms debounce - more than adequate for rain gauge
     const TickType_t BOUNCE_SETTLE_TIME = pdMS_TO_TICKS(200); // 200ms settle to reduce gap while still debouncing
     
