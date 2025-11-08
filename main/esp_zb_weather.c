@@ -408,12 +408,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 rain_gauge_enable_isr();
                 ESP_LOGI(TAG, "📡 Re-enabled rain gauge after reboot (previously connected network)");
                 
-                // /* Schedule sensor data reporting and sleep after wake-up from deep sleep */
-                // ESP_LOGI(TAG, "📊 Scheduling sensor data reporting after wake-up");
-                // esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 1000); // Report in 1 second
-                // esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 2000); // Report rainfall in 2 seconds
-                // esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 3000); // Report battery in 3 seconds
-                // esp_zb_scheduler_alarm((esp_zb_callback_t)sleep_duration_report, 0, 4000); // Report sleep duration in 4 seconds
+                /* Schedule sensor data reporting and sleep after wake-up from deep sleep */
+                ESP_LOGI(TAG, "📊 Scheduling sensor data reporting after wake-up");
+                esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 1000); // Report in 1 second
+                esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 2000); // Report rainfall in 2 seconds
+                esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 3000); // Report battery in 3 seconds
+                esp_zb_scheduler_alarm((esp_zb_callback_t)sleep_duration_report, 0, 4000); // Report sleep duration in 4 seconds
                 
                 /* Check if OTA is in progress before scheduling deep sleep */
                 if (esp_zb_ota_is_active()) {
@@ -424,8 +424,8 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 } else {
                     /* Schedule deep sleep after reporting window */
                     if (!deep_sleep_scheduled) {
-                        ESP_LOGI(TAG, "⏰ Scheduling deep sleep after reporting window (5 seconds)");
-                        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 7000);
+                        ESP_LOGI(TAG, "⏰ Scheduling deep sleep after reporting window");
+                        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000);
                         deep_sleep_scheduled = true;
                     }
                 }
@@ -477,7 +477,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
                 /* Now that we're connected, schedule normal deep sleep after allowing time for data reporting */
                 if (!deep_sleep_scheduled) {
                     ESP_LOGI(TAG, "📡 Network connected! Scheduling sleep after sensor data reporting (5 seconds)");
-                    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 7000); // 7 seconds for reporting
+                    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000); // 15 seconds for reporting
                     deep_sleep_scheduled = true;
                 }
             }
@@ -651,7 +651,7 @@ static void prepare_for_deep_sleep(uint8_t param)
     if (esp_zb_ota_is_active()) {
         ESP_LOGW(TAG, "⚠️ OTA upgrade in progress, postponing deep sleep...");
         /* Reschedule sleep check in 30 seconds */
-        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 30000);
+        esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 60000);
         return;
     }
     
@@ -733,7 +733,7 @@ static void check_ota_status(uint8_t param)
         /* OTA completed or not active - schedule deep sleep */
         ESP_LOGI(TAG, "✅ OTA check complete, scheduling deep sleep");
         if (!deep_sleep_scheduled && zigbee_network_connected) {
-            esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 7000);
+            esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000);
             deep_sleep_scheduled = true;
         }
     }
@@ -1009,7 +1009,7 @@ static void esp_zb_task(void *pvParameters)
     /* Schedule deep sleep entry - but only after network connection or extended timeout */
     if (zigbee_network_connected) {
         /* Already connected, can sleep normally after initial operations */
-    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 7000); // 7 seconds
+    esp_zb_scheduler_alarm((esp_zb_callback_t)prepare_for_deep_sleep, 0, 15000); // 15 seconds
     } else {
         /* Not connected yet, wait longer for join process and retry connection attempts */
         ESP_LOGI(TAG, "📡 Network not connected, extending wake time for join process (60 seconds)");
@@ -1371,7 +1371,7 @@ static const char *BATTERY_TAG = "BATTERY";
 #define BATTERY_ADC_ATTEN       ADC_ATTEN_DB_12  // 0-3.1V range (ESP32-H2: actually 0-2.5V)
 
 // For Li-Ion battery monitoring via voltage divider:
-// Hardware: R1=99kΩ, R2=99.1kΩ → theoretical divider = 2.0
+// Hardware: R1=100kΩ, R2=100kΩ → theoretical divider = 2.0
 // However, ESP32-H2 ADC calibration has issues with DB_12 attenuation
 // Empirical calibration: ADC reads 1300mV when actual is 2085mV
 // Correction factor: 2085/1300 = 1.604
@@ -1498,26 +1498,51 @@ static void battery_read_and_report(uint8_t param)
             force_read = true;
         } else {
             uint32_t elapsed_sec = current_time_sec - last_battery_read_time;
-            
             ESP_LOGI(BATTERY_TAG, "⏱️  Elapsed time: %lu seconds (need %lu for next reading)", 
                      elapsed_sec, BATTERY_READ_INTERVAL_SEC);
-            
             if (elapsed_sec < BATTERY_READ_INTERVAL_SEC) {
                 ESP_LOGI(BATTERY_TAG, "⏭️  Skipping battery read (%lu sec since last, need %lu)", 
                          elapsed_sec, BATTERY_READ_INTERVAL_SEC);
+                // Read last battery values from NVS and update Zigbee attributes
+                float battery_voltage = 0.0f;
+                float percentage = 0.0f;
+                uint8_t zigbee_voltage = 0;
+                uint8_t zigbee_percentage = 0;
+                esp_err_t nvs_err = nvs_open("storage", NVS_READONLY, &nvs_handle);
+                if (nvs_err == ESP_OK) {
+                    nvs_get_u8(nvs_handle, "batt_zb_v", &zigbee_voltage);
+                    nvs_get_u8(nvs_handle, "batt_zb_p", &zigbee_percentage);
+                    nvs_get_blob(nvs_handle, "batt_v", &battery_voltage, &(size_t){sizeof(float)});
+                    nvs_get_blob(nvs_handle, "batt_pct", &percentage, &(size_t){sizeof(float)});
+                    nvs_close(nvs_handle);
+                }
+                // Update Zigbee attributes with last known values
+                esp_zb_zcl_set_attribute_val(
+                    HA_ESP_BME280_ENDPOINT,
+                    ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                    0x0020,
+                    &zigbee_voltage,
+                    false);
+                esp_zb_zcl_set_attribute_val(
+                    HA_ESP_BME280_ENDPOINT,
+                    ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                    ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+                    0x0021,
+                    &zigbee_percentage,
+                    false);
+                ESP_LOGI(BATTERY_TAG, "🔁 Restored battery values from NVS: %.2fV (%.0f%%) - Zigbee: %u, %u",
+                         battery_voltage, percentage, zigbee_voltage, zigbee_percentage);
                 return;  // Skip this reading
             }
-            
             ESP_LOGI(BATTERY_TAG, "🔋 Reading battery (last read %lu sec ago)", elapsed_sec);
         }
     }
-    
     if (first_reading) {
         ESP_LOGI(BATTERY_TAG, "🔋 Reading battery (first reading after boot/pairing)");
     } else if (force_read) {
         ESP_LOGI(BATTERY_TAG, "🔋 Reading battery (forced after reboot)");
     }
-    
     // Time to read battery - update timestamp in NVS
     err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
     if (err == ESP_OK) {
@@ -1525,18 +1550,15 @@ static void battery_read_and_report(uint8_t param)
         nvs_commit(nvs_handle);
         nvs_close(nvs_handle);
     }
-    
     float battery_voltage = 0.0f;
-    
     if (adc_handle == NULL) {
         ESP_LOGE(BATTERY_TAG, "ADC not initialized, using simulated value");
         battery_voltage = 3.7f;  // Fallback simulated value
     } else {
-    /* Power optimization: Reduced from 10 to 3 samples (better accuracy, still low power) */
-    const int num_samples = 3;
+        /* Power optimization: Reduced from 10 to 3 samples (better accuracy, still low power) */
+        const int num_samples = 3;
         int voltage_sum = 0;
         int raw_sum = 0;
-        
         for (int i = 0; i < num_samples; i++) {
             int adc_raw;
             esp_err_t ret = adc_oneshot_read(adc_handle, BATTERY_ADC_CHANNEL, &adc_raw);
@@ -1545,9 +1567,7 @@ static void battery_read_and_report(uint8_t param)
                 battery_voltage = 3.7f;  // Fallback value
                 goto skip_adc;
             }
-            
             raw_sum += adc_raw;  // Track raw ADC values for debugging
-            
             int voltage_mv;
             if (adc_cali_handle != NULL) {
                 ret = adc_cali_raw_to_voltage(adc_cali_handle, adc_raw, &voltage_mv);
@@ -1563,36 +1583,38 @@ static void battery_read_and_report(uint8_t param)
                 voltage_mv = (adc_raw * 2500) / 4095;
                 voltage_mv = (int)((float)voltage_mv * BATTERY_ADC_CORRECTION);
             }
-            
             voltage_sum += voltage_mv;
             /* Power optimization: Removed 10ms delay - ADC can sample back-to-back (saves ~90% overhead) */
         }
-        
         // Calculate average voltage at ADC input (in volts)
         float adc_voltage = (voltage_sum / num_samples) / 1000.0f;
         int avg_raw = raw_sum / num_samples;
-        
         // Apply voltage divider multiplier to get actual battery voltage
         battery_voltage = adc_voltage * BATTERY_VOLTAGE_DIVIDER;
-        
         ESP_LOGI(BATTERY_TAG, "📊 ADC raw avg: %d, calibrated: %dmV (%.3fV) → Battery: %.2fV", 
                  avg_raw, voltage_sum / num_samples, adc_voltage, battery_voltage);
     }
-    
 skip_adc:
-    
     // Calculate battery percentage (0-100%) using Li-Ion discharge curve
     // Li-Ion voltage curve is fairly linear between 3.0V-4.2V
     float percentage = ((battery_voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0f;
     if (percentage > 100.0f) percentage = 100.0f;
     if (percentage < 0.0f) percentage = 0.0f;
-    
     // Zigbee uses different units:
     // - Battery voltage: 0.1V units (e.g., 30 = 3.0V)
     // - Battery percentage: 0-200 scale (200 = 100%, 100 = 50%)
     uint8_t zigbee_voltage = (uint8_t)(battery_voltage * 10.0f);
     uint8_t zigbee_percentage = (uint8_t)(percentage * 2.0f);
-    
+    // Store last measured values in NVS
+    err = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    if (err == ESP_OK) {
+        nvs_set_u8(nvs_handle, "batt_zb_v", zigbee_voltage);
+        nvs_set_u8(nvs_handle, "batt_zb_p", zigbee_percentage);
+        nvs_set_blob(nvs_handle, "batt_v", &battery_voltage, sizeof(float));
+        nvs_set_blob(nvs_handle, "batt_pct", &percentage, sizeof(float));
+        nvs_commit(nvs_handle);
+        nvs_close(nvs_handle);
+    }
     // Update battery voltage attribute (0x0020)
     esp_err_t ret = esp_zb_zcl_set_attribute_val(
         HA_ESP_BME280_ENDPOINT,
@@ -1602,11 +1624,9 @@ skip_adc:
         &zigbee_voltage,
         false  // Don't force report, let reporting configuration handle it
     );
-    
     if (ret != ESP_OK) {
         ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery voltage: %s", esp_err_to_name(ret));
     }
-    
     // Update battery percentage attribute (0x0021)
     ret = esp_zb_zcl_set_attribute_val(
         HA_ESP_BME280_ENDPOINT,
@@ -1616,11 +1636,9 @@ skip_adc:
         &zigbee_percentage,
         false
     );
-    
     if (ret != ESP_OK) {
         ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
     }
-    
     ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) - Zigbee values: %u (0.1V), %u (%%*2)", 
              battery_voltage, percentage, zigbee_voltage, zigbee_percentage);
 }
@@ -1823,9 +1841,6 @@ static void rain_gauge_init(void)
     
     /* Start hourly reporting timer */
     esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_hourly_check, 0, 3600000); // First check in 1 hour
-    
-    /* Add a more frequent debug check initially (every 30 seconds for debugging) */
-    esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_hourly_check, 0, 30000); // First debug check in 30 seconds
 }
 
 void app_main(void)
