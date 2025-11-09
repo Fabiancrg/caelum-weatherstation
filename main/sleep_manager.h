@@ -3,7 +3,7 @@
  *
  * SPDX-License-Identifier:  LicenseRef-Included
  *
- * ESP32-H2 Deep Sleep Management Header
+ * ESP32-H2 Light Sleep Management Header
  */
 
 #ifndef SLEEP_MANAGER_H
@@ -35,7 +35,7 @@ typedef enum {
 wake_reason_t check_wake_reason(void);
 
 /**
- * @brief Configure GPIO for wake-up from deep sleep
+ * @brief Configure GPIO for wake-up from light sleep
  * 
  * @param gpio_num GPIO number to monitor
  * @param level Wake-up level (0=LOW, 1=HIGH)
@@ -60,12 +60,12 @@ void save_rainfall_data(float rainfall_mm, uint32_t pulse_count);
 bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count);
 
 /**
- * @brief Enter deep sleep mode with wake-up sources
+ * @brief Enter light sleep mode with wake-up sources
  * 
  * @param duration_seconds Sleep duration in seconds (0 = infinite)
  * @param enable_gpio_wakeup Enable GPIO wake-up for rain detection
  */
-void enter_deep_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup);
+void enter_light_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup);
 
 /**
  * @brief Calculate estimated battery life

@@ -3,13 +3,15 @@
  *
  * SPDX-License-Identifier:  LicenseRef-Included
  *
- * ESP32-H2 Deep Sleep Management for Weather Station
+ * ESP32-H2 Light Sleep Management for Weather Station
  *
- * This file implements deep sleep functionality for battery-powered operation
+ * This file implements light sleep functionality for battery-powered operation
+ * with maintained Zigbee network connection for instant wake and reporting
  */
 
 #include "esp_sleep.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/gpio.h"
 #include "driver/rtc_io.h"
 #include "nvs_flash.h"
@@ -177,13 +179,13 @@ bool load_rainfall_data(float *rainfall_mm, uint32_t *pulse_count)
 }
 
 /**
- * @brief Enter deep sleep mode
+ * @brief Enter light sleep mode
  * @param duration_seconds Sleep duration in seconds (0 = infinite)
  * @param enable_gpio_wakeup Enable GPIO wake-up for rain detection
  */
-void enter_deep_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup)
+void enter_light_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup)
 {
-    ESP_LOGI(SLEEP_TAG, "🌙 Preparing to enter deep sleep...");
+    ESP_LOGI(SLEEP_TAG, "🌙 Preparing to enter light sleep...");
     
     /* Configure timer wake-up if duration specified */
     if (duration_seconds > 0) {
@@ -195,12 +197,11 @@ void enter_deep_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup)
     /* Configure GPIO wake-up for rain detection */
     bool gpio_wakeup_enabled = false;
     if (enable_gpio_wakeup) {
-        if (rtc_gpio_is_valid_gpio(RAIN_WAKE_GPIO)) {
-            configure_gpio_wakeup(RAIN_WAKE_GPIO, 1); // Wake on HIGH (rain pulse)
-            gpio_wakeup_enabled = true;
-        } else {
-            ESP_LOGW(SLEEP_TAG, "⚠️  Rain wake-up not available (GPIO%d not RTC capable)", RAIN_WAKE_GPIO);
-        }
+        // For light sleep, we can use any GPIO, not just RTC-capable ones
+        esp_sleep_enable_gpio_wakeup();
+        gpio_wakeup_enable(RAIN_WAKE_GPIO, GPIO_INTR_HIGH_LEVEL);
+        gpio_wakeup_enabled = true;
+        ESP_LOGI(SLEEP_TAG, "🌧️ Rain wake-up enabled on GPIO%d", RAIN_WAKE_GPIO);
     }
     
     /* Disable LEDs to save power */
@@ -208,8 +209,8 @@ void enter_deep_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup)
     // LED strip and GPIO LED should already be off
     
     /* Print power consumption estimate */
-    ESP_LOGI(SLEEP_TAG, "📊 Expected sleep current: 7-10 µA");
-    ESP_LOGI(SLEEP_TAG, "🔋 Battery life estimate: 3+ years with 2500mAh battery");
+    ESP_LOGI(SLEEP_TAG, "📊 Expected sleep current: 150-300 µA (light sleep with Zigbee stack)");
+    ESP_LOGI(SLEEP_TAG, "🔋 Battery life estimate: 1-2 years with 2500mAh battery");
     
     /* Print wake-up configuration */
     ESP_LOGI(SLEEP_TAG, "Wake-up sources enabled:");
@@ -218,23 +219,50 @@ void enter_deep_sleep(uint32_t duration_seconds, bool enable_gpio_wakeup)
     }
     if (gpio_wakeup_enabled) {
         ESP_LOGI(SLEEP_TAG, "  🌧️ Rain: GPIO%d (>%.1f mm)", RAIN_WAKE_GPIO, RAIN_MM_THRESHOLD);
-    } else if (enable_gpio_wakeup) {
-        ESP_LOGI(SLEEP_TAG, "  🌧️ Rain: DISABLED (GPIO%d not RTC capable)", RAIN_WAKE_GPIO);
-        ESP_LOGI(SLEEP_TAG, "      Rain detection limited to timer wake-ups only");
     }
     
     /* Flush all logs before sleeping */
-    esp_log_level_set("*", ESP_LOG_INFO);
-    vTaskDelay(pdMS_TO_TICKS(100)); // Give time for logs to flush
+    vTaskDelay(pdMS_TO_TICKS(50));
     
-    ESP_LOGI(SLEEP_TAG, "💤 Entering deep sleep NOW...");
+    /* CRITICAL: Enable Zigbee sleep mode before entering light sleep */
+    ESP_LOGI(SLEEP_TAG, "� Enabling Zigbee sleep mode...");
+    esp_zb_sleep_enable(true);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    ESP_LOGI(SLEEP_TAG, "�💤 Entering light sleep NOW...");
     ESP_LOGI(SLEEP_TAG, "========================================");
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(50));
     
-    /* Enter deep sleep */
-    esp_deep_sleep_start();
+    /* Enter light sleep - execution will continue from here after wake */
+    int64_t t_before_sleep = esp_timer_get_time();
+    esp_light_sleep_start();
+    int64_t t_after_sleep = esp_timer_get_time();
     
-    /* This line is never reached */
+    /* CRITICAL: Disable Zigbee sleep mode after wake */
+    esp_zb_sleep_enable(false);
+    
+    /* Calculate sleep duration */
+    uint32_t sleep_time_ms = (uint32_t)((t_after_sleep - t_before_sleep) / 1000);
+    
+    /* Determine wake reason */
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    switch (wakeup_reason) {
+        case ESP_SLEEP_WAKEUP_TIMER:
+            ESP_LOGI(SLEEP_TAG, "⏰ Woke from light sleep by TIMER after %lu ms", sleep_time_ms);
+            break;
+        case ESP_SLEEP_WAKEUP_GPIO:
+            ESP_LOGI(SLEEP_TAG, "🌧️ Woke from light sleep by RAIN DETECTION (GPIO) after %lu ms", sleep_time_ms);
+            break;
+        default:
+            ESP_LOGI(SLEEP_TAG, "❓ Woke from light sleep by UNKNOWN reason (%d) after %lu ms", wakeup_reason, sleep_time_ms);
+            break;
+    }
+    ESP_LOGI(SLEEP_TAG, "========================================");
+    
+    /* Re-enable GPIO wakeup for next sleep cycle */
+    if (gpio_wakeup_enabled) {
+        gpio_wakeup_disable(RAIN_WAKE_GPIO);
+    }
 }
 
 /**
