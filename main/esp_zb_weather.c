@@ -370,22 +370,22 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGI(RAIN_TAG, "Rain gauge enabled - device connected to Zigbee network");
             
             /* Schedule sensor data reporting after first connection 
-             * Force initial reports (true) so coordinator sees values immediately.
-             * Subsequent reports controlled by coordinator configuration.
-             * Delay reports 5-10 seconds to ensure Zigbee stack is fully ready. */
-            ESP_LOGI(TAG, "📊 Scheduling initial sensor data reporting after network join");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 1, 5000); // Report in 5 seconds, FORCE
-            esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 1, 7000); // Report rainfall in 7 seconds, FORCE
-            esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 1, 9000); // Report battery in 9 seconds, FORCE
+             * Update attributes (but don't force reports) so coordinator can read current values.
+             * Actual reports will be sent based on coordinator's reporting configuration.
+             * After reboot, reporting config is lost and must be reconfigured by coordinator. */
+            ESP_LOGI(TAG, "📊 Scheduling initial sensor data updates after network join");
+            esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 2000); // Update in 2 seconds
+            esp_zb_scheduler_alarm((esp_zb_callback_t)rain_gauge_zigbee_update, 0, 3000); // Update in 3 seconds  
+            esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 4000); // Update in 4 seconds
             
             /* Start periodic sensor reading timer for 15-minute intervals.
              * This ensures sensors are read regularly and attributes stay updated.
              * Actual reporting to coordinator is controlled by Zigbee reporting configuration. */
             start_periodic_reading();
             
-            /* Deinitialize LED after successful join - LED kept on until all reports complete */
-            ESP_LOGI(TAG, "💡 LED will power down in 15 seconds after all reports complete");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 15000); // Power down LED after all reports
+            /* Deinitialize LED after successful join - LED kept on briefly to confirm join */
+            ESP_LOGI(TAG, "💡 LED will power down in 5 seconds to save battery");
+            esp_zb_scheduler_alarm((esp_zb_callback_t)debug_led_deinit, 0, 5000); // Power down LED
             
             /* Device will enter light sleep automatically when all initial reports complete */
             ESP_LOGI(TAG, "💤 Initial reports scheduled - device will sleep when idle");
@@ -626,29 +626,38 @@ static void esp_zb_task(void *pvParameters)
     
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_basic_cluster(esp_zb_bme280_clusters, esp_zb_basic_bme280_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
-    /* Create Temperature measurement cluster */
-    esp_zb_temperature_meas_cluster_cfg_t temp_meas_cfg = {
-        .measured_value = 0x8000,  // Invalid/unknown temperature value
-        .min_value = -40 * 100,     // -40°C in centidegrees
-        .max_value = 85 * 100,      // 85°C in centidegrees (BME280 range)
-    };
-    esp_zb_attribute_list_t *esp_zb_temperature_cluster = esp_zb_temperature_meas_cluster_create(&temp_meas_cfg);
+    /* Create Temperature measurement cluster with REPORTING flag for persistence
+     * According to ESP Zigbee SDK docs: attributes must have ESP_ZB_ZCL_ATTR_ACCESS_REPORTING
+     * flag for reporting configuration to be stored in zb_storage partition and persist across reboots */
+    int16_t temp_value = 0x8000;  // Invalid/unknown temperature value initially
+    int16_t temp_min = -40 * 100;  // -40°C in centidegrees  
+    int16_t temp_max = 85 * 100;   // 85°C in centidegrees (BME280 range)
+    esp_zb_attribute_list_t *esp_zb_temperature_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_temperature_cluster, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, 
+                                            ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, ESP_ZB_ZCL_ATTR_TYPE_S16, 
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &temp_value));
+    ESP_ERROR_CHECK(esp_zb_temperature_meas_cluster_add_attr(esp_zb_temperature_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MIN_VALUE_ID, &temp_min));
+    ESP_ERROR_CHECK(esp_zb_temperature_meas_cluster_add_attr(esp_zb_temperature_cluster, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_MAX_VALUE_ID, &temp_max));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_temperature_meas_cluster(esp_zb_bme280_clusters, esp_zb_temperature_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
-    /* Create Humidity measurement cluster */
-    esp_zb_humidity_meas_cluster_cfg_t hum_meas_cfg = {
-        .measured_value = 0xFFFF,   // Invalid/unknown humidity value
-        .min_value = 0 * 100,       // 0% in centipercent
-        .max_value = 100 * 100,     // 100% in centipercent
-    };
-    esp_zb_attribute_list_t *esp_zb_humidity_cluster = esp_zb_humidity_meas_cluster_create(&hum_meas_cfg);
+    /* Create Humidity measurement cluster with REPORTING flag */
+    uint16_t hum_value = 0xFFFF;  // Invalid/unknown humidity value initially
+    uint16_t hum_min = 0 * 100;   // 0% in centipercent
+    uint16_t hum_max = 100 * 100; // 100% in centipercent
+    esp_zb_attribute_list_t *esp_zb_humidity_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_humidity_cluster, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+                                            ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID, ESP_ZB_ZCL_ATTR_TYPE_U16,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &hum_value));
+    ESP_ERROR_CHECK(esp_zb_humidity_meas_cluster_add_attr(esp_zb_humidity_cluster, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MIN_VALUE_ID, &hum_min));
+    ESP_ERROR_CHECK(esp_zb_humidity_meas_cluster_add_attr(esp_zb_humidity_cluster, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_MAX_VALUE_ID, &hum_max));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_humidity_meas_cluster(esp_zb_bme280_clusters, esp_zb_humidity_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
-    /* Create Pressure measurement cluster */
-    esp_zb_pressure_meas_cluster_cfg_t pressure_meas_cfg = {
-        .measured_value = ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_UNKNOWN,  // Invalid/unknown pressure value initially
-    };
-    esp_zb_attribute_list_t *esp_zb_pressure_cluster = esp_zb_pressure_meas_cluster_create(&pressure_meas_cfg);
+    /* Create Pressure measurement cluster with REPORTING flag */
+    int16_t pressure_value = ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_UNKNOWN;  // Invalid/unknown initially
+    esp_zb_attribute_list_t *esp_zb_pressure_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_pressure_cluster, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
+                                            ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, ESP_ZB_ZCL_ATTR_TYPE_S16,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &pressure_value));
     ESP_ERROR_CHECK(esp_zb_cluster_list_add_pressure_meas_cluster(esp_zb_bme280_clusters, esp_zb_pressure_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE));
     
     /* Add Identify cluster for BME280 endpoint */
@@ -660,7 +669,8 @@ static void esp_zb_task(void *pvParameters)
     };
     esp_zb_attribute_list_t *esp_zb_power_cluster = esp_zb_power_config_cluster_create(&power_cfg);
     
-    /* Add battery-specific attributes using raw attribute IDs */
+    /* Add battery-specific attributes with REPORTING flag for battery voltage and percentage
+     * These are the key attributes that need to be reported for battery monitoring */
     uint8_t battery_voltage = 0xFF;       // Unknown initially (0.1V units, e.g., 37 = 3.7V)
     uint8_t battery_percentage = 0xFF;    // Unknown initially (0-200, where 200 = 100%)
     uint8_t battery_size = 0xFF;          // 0xFF = other/unknown
@@ -669,8 +679,12 @@ static void esp_zb_task(void *pvParameters)
     uint8_t battery_alarm_mask = 0;
     uint8_t battery_voltage_min_threshold = 27;  // 2.7V low battery warning for Li-Ion
     
-    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0020, &battery_voltage);                    // Battery Voltage
-    esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0021, &battery_percentage);                 // Battery Percentage Remaining
+    // Battery voltage and percentage with REPORTING flag for persistence
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_power_cluster, ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG, 0x0020, ESP_ZB_ZCL_ATTR_TYPE_U8,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &battery_voltage));
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_power_cluster, ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG, 0x0021, ESP_ZB_ZCL_ATTR_TYPE_U8,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &battery_percentage));
+    // Other battery attributes (read-only, no reporting needed)
     esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0031, &battery_size);                       // Battery Size
     esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0033, &battery_quantity);                   // Battery Quantity
     esp_zb_power_config_cluster_add_attr(esp_zb_power_cluster, 0x0034, &battery_rated_voltage);              // Battery Rated Voltage
@@ -732,11 +746,13 @@ static void esp_zb_task(void *pvParameters)
      * does not attempt to read device-level Basic attributes here.
      */
     
-    /* Create Analog Input cluster for rain gauge (reports rainfall in mm) */
-    esp_zb_analog_input_cluster_cfg_t rain_analog_cfg = {
-        .present_value = total_rainfall_mm,  // Initialize with loaded value from NVS
-    };
-    esp_zb_attribute_list_t *esp_zb_rain_analog_cluster = esp_zb_analog_input_cluster_create(&rain_analog_cfg);
+    /* Create Analog Input cluster for rain gauge with REPORTING flag
+     * Present value must have REPORTING flag for reporting config persistence */
+    float rain_present_value = total_rainfall_mm;  // Initialize with loaded value from NVS
+    esp_zb_attribute_list_t *esp_zb_rain_analog_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT);
+    ESP_ERROR_CHECK(esp_zb_cluster_add_attr(esp_zb_rain_analog_cluster, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                                            ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, ESP_ZB_ZCL_ATTR_TYPE_SINGLE,
+                                            ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY | ESP_ZB_ZCL_ATTR_ACCESS_REPORTING, &rain_present_value));
     
     /* Add description attribute */
     char rain_description[] = "\x0E""Rainfall Total";  // Length-prefixed: 14 bytes + "Rainfall Total"
@@ -781,6 +797,61 @@ static void esp_zb_task(void *pvParameters)
 
     esp_zb_device_register(esp_zb_ep_list);
     esp_zb_core_action_handler_register(zb_action_handler);
+    
+    /* Debug: Verify REPORTING flag is set on critical attributes
+     * According to ESP Zigbee SDK docs (section 5.7.4): Use esp_zb_zcl_get_attribute() to verify
+     * ESP_ZB_ZCL_ATTR_ACCESS_REPORTING is set in the returned attribute access flags */
+    ESP_LOGI(TAG, "🔍 Verifying REPORTING flag on attributes...");
+    esp_zb_zcl_attr_t *attr;
+    
+    // Check temperature
+    attr = esp_zb_zcl_get_attribute(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, 
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID);
+    if (attr) {
+        ESP_LOGI(TAG, "  Temperature: access=0x%02x %s", attr->access, 
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
+    // Check humidity
+    attr = esp_zb_zcl_get_attribute(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID);
+    if (attr) {
+        ESP_LOGI(TAG, "  Humidity: access=0x%02x %s", attr->access,
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
+    // Check pressure
+    attr = esp_zb_zcl_get_attribute(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID);
+    if (attr) {
+        ESP_LOGI(TAG, "  Pressure: access=0x%02x %s", attr->access,
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
+    // Check rain gauge
+    attr = esp_zb_zcl_get_attribute(HA_ESP_RAIN_GAUGE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
+    if (attr) {
+        ESP_LOGI(TAG, "  Rain gauge: access=0x%02x %s", attr->access,
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
+    // Check battery voltage
+    attr = esp_zb_zcl_get_attribute(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 0x0020);
+    if (attr) {
+        ESP_LOGI(TAG, "  Battery voltage: access=0x%02x %s", attr->access,
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
+    // Check battery percentage
+    attr = esp_zb_zcl_get_attribute(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+                                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, 0x0021);
+    if (attr) {
+        ESP_LOGI(TAG, "  Battery percentage: access=0x%02x %s", attr->access,
+                 (attr->access & ESP_ZB_ZCL_ATTR_ACCESS_REPORTING) ? "✅ REPORTING" : "❌ NO REPORTING");
+    }
+    
     ESP_LOGI(TAG, "[CFG] Setting Zigbee channel mask: 0x%08lX", (unsigned long)ESP_ZB_PRIMARY_CHANNEL_MASK);
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
@@ -798,31 +869,6 @@ static void esp_zb_task(void *pvParameters)
     ESP_LOGI(TAG, "💤 Light sleep will be triggered automatically when stack is idle");
     esp_zb_stack_main_loop();
 }
-
-/* Wrapper around esp_zb_zcl_set_attribute_val that retries a few times
- * This helps when we request a forced report immediately after join and
- * the Zigbee stack isn't fully ready to send the report.
- */
-static esp_err_t zcl_set_attr_with_retry(uint8_t endpoint, uint32_t cluster, uint8_t role, uint16_t attr_id, void *value, bool force_report)
-{
-    const int max_attempts = 3;
-    esp_err_t ret = ESP_FAIL;
-    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-    ret = esp_zb_zcl_set_attribute_val(endpoint, cluster, role, attr_id, value, force_report);
-        if (ret == ESP_OK) {
-            return ESP_OK;
-        }
-        ESP_LOGW(TAG, "zcl_set_attr failed (attempt %d/%d) for ep=%d cluster=0x%04x attr=0x%04x: %s", attempt, max_attempts,
-                 endpoint, (unsigned)cluster, attr_id, esp_err_to_name(ret));
-        /* Backoff before retrying */
-        vTaskDelay(pdMS_TO_TICKS(100 * attempt));
-    }
-    ESP_LOGE(TAG, "zcl_set_attr failed after %d attempts: ep=%d cluster=0x%04x attr=0x%04x: %s",
-             max_attempts, endpoint, (unsigned)cluster, attr_id, esp_err_to_name(ret));
-    return ret;
-}
-
-
 
 /* Factory reset function */
 static void builtin_button_callback(button_action_t action)
@@ -864,8 +910,9 @@ static void bme280_read_and_report(uint8_t param)
     float temperature, humidity, pressure;
     esp_err_t ret;
     
-    /* param: 0 = don't force report (coordinator controls), 1 = force report (initial join) */
-    bool force_report = (param == 1);
+    /* param: Always 0 (normal attribute update - coordinator controls reporting).
+     * Forced reports (param=1) fail after reboot because reporting config is not persisted. */
+    bool force_report = false;  // Never force - reporting config lost on reboot
     
     /* Wake BME280 from sleep and trigger forced measurement */
     ret = bme280_app_wake_and_measure();
@@ -880,13 +927,13 @@ static void bme280_read_and_report(uint8_t param)
         // Convert to centidegrees (Zigbee temperature unit: 0.01°C)
         int16_t temp_centidegrees = (int16_t)(temperature * 100);
         
-    ret = zcl_set_attr_with_retry(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, 
-                      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, 
-                      &temp_centidegrees, force_report);
+        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT, 
+                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID, 
+                                           &temp_centidegrees, force_report);
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "🌡️ Temperature: %.2f°C %s", temperature, force_report ? "FORCED REPORT" : "updated");
+            ESP_LOGI(TAG, "🌡️ Temperature: %.2f°C (attribute updated)", temperature);
         } else {
-            ESP_LOGE(TAG, "Failed to report temperature: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to update temperature attribute: %s", esp_err_to_name(ret));
         }
     } else {
         ESP_LOGE(TAG, "Failed to read temperature: %s", esp_err_to_name(ret));
@@ -898,13 +945,13 @@ static void bme280_read_and_report(uint8_t param)
         // Convert to centipercent (Zigbee humidity unit: 0.01%)
         uint16_t hum_centipercent = (uint16_t)(humidity * 100);
         
-    ret = zcl_set_attr_with_retry(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT, 
-                      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID, 
-                      &hum_centipercent, force_report);
+        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_REL_HUMIDITY_MEASUREMENT, 
+                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_REL_HUMIDITY_MEASUREMENT_VALUE_ID, 
+                                           &hum_centipercent, force_report);
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "💧 Humidity: %.2f%% %s", humidity, force_report ? "FORCED REPORT" : "updated");
+            ESP_LOGI(TAG, "💧 Humidity: %.2f%% (attribute updated)", humidity);
         } else {
-            ESP_LOGE(TAG, "Failed to report humidity: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to update humidity attribute: %s", esp_err_to_name(ret));
         }
     } else {
         ESP_LOGE(TAG, "Failed to read humidity: %s", esp_err_to_name(ret));
@@ -917,13 +964,13 @@ static void bme280_read_and_report(uint8_t param)
         // 1 hPa = 0.1 kPa, so pressure in hPa * 10 = pressure in 0.1 kPa
         int16_t pressure_zigbee = (int16_t)(pressure * 10);
         
-    ret = zcl_set_attr_with_retry(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, 
-                      ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, 
-                      &pressure_zigbee, force_report);
+        ret = esp_zb_zcl_set_attribute_val(HA_ESP_BME280_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_PRESSURE_MEASUREMENT, 
+                                           ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_PRESSURE_MEASUREMENT_VALUE_ID, 
+                                           &pressure_zigbee, force_report);
         if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "🌪️  Pressure: %.2f hPa (raw: %d x0.1kPa) %s", pressure, pressure_zigbee, force_report ? "FORCED REPORT" : "updated");
+            ESP_LOGI(TAG, "🌪️  Pressure: %.2f hPa (raw: %d x0.1kPa - attribute updated)", pressure, pressure_zigbee);
         } else {
-            ESP_LOGE(TAG, "Failed to report pressure: %s", esp_err_to_name(ret));
+            ESP_LOGE(TAG, "Failed to update pressure attribute: %s", esp_err_to_name(ret));
         }
     } else {
         ESP_LOGE(TAG, "Failed to read pressure: %s", esp_err_to_name(ret));
@@ -1120,18 +1167,19 @@ static void rain_gauge_disable_isr(void)
 
 static void rain_gauge_zigbee_update(uint8_t param)
 {
-    // param: 0 = don't force report (coordinator controls), 1 = force report (initial join)
-    bool force_report = (param == 1);
+    // param: Always 0 (normal update - coordinator controls reporting)
+    // Forced reports fail after reboot because reporting config is not persisted
+    bool force_report = false;
     
     // Round to 2 decimal places to avoid floating-point precision issues
     float rounded_rainfall = roundf(total_rainfall_mm * 100.0f) / 100.0f;
     
-    esp_err_t ret = zcl_set_attr_with_retry(HA_ESP_RAIN_GAUGE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-                                                 ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-                                                 &rounded_rainfall, force_report);
+    esp_err_t ret = esp_zb_zcl_set_attribute_val(HA_ESP_RAIN_GAUGE_ENDPOINT, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+                                                  &rounded_rainfall, force_report);
     
     if (ret == ESP_OK) {
-        ESP_LOGI(RAIN_TAG, "✅ Rain: %.2f mm %s", rounded_rainfall, force_report ? "FORCED REPORT" : "updated");
+        ESP_LOGI(RAIN_TAG, "✅ Rain: %.2f mm (attribute updated)", rounded_rainfall);
     } else {
         ESP_LOGE(RAIN_TAG, "❌ Failed to update rain attribute: %s", esp_err_to_name(ret));
     }
@@ -1222,8 +1270,9 @@ static esp_err_t battery_adc_init(void)
 
 static void battery_read_and_report(uint8_t param)
 {
-    // param: 0 = don't force report (coordinator controls), 1 = force report (initial join)
-    bool force_report = (param == 1);
+    // param: Always 0 (normal update - coordinator controls reporting)
+    // Forced reports fail after reboot because reporting config is not persisted
+    bool force_report = false;
     
     ESP_LOGI(BATTERY_TAG, "🔧 battery_read_and_report() called");
     
@@ -1294,14 +1343,14 @@ static void battery_read_and_report(uint8_t param)
                     nvs_close(nvs_handle);
                 }
                 // Update Zigbee attributes with last known values
-                zcl_set_attr_with_retry(
+                esp_zb_zcl_set_attribute_val(
                     HA_ESP_BME280_ENDPOINT,
                     ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
                     0x0020,
                     &zigbee_voltage,
                     force_report);
-                zcl_set_attr_with_retry(
+                esp_zb_zcl_set_attribute_val(
                     HA_ESP_BME280_ENDPOINT,
                     ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
                     ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -1393,7 +1442,7 @@ skip_adc:
         nvs_close(nvs_handle);
     }
     // Update battery voltage attribute (0x0020)
-    esp_err_t ret = zcl_set_attr_with_retry(
+    esp_err_t ret = esp_zb_zcl_set_attribute_val(
         HA_ESP_BME280_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -1405,7 +1454,7 @@ skip_adc:
         ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery voltage: %s", esp_err_to_name(ret));
     }
     // Update battery percentage attribute (0x0021)
-    ret = zcl_set_attr_with_retry(
+    ret = esp_zb_zcl_set_attribute_val(
         HA_ESP_BME280_ENDPOINT,
         ESP_ZB_ZCL_CLUSTER_ID_POWER_CONFIG,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
@@ -1416,8 +1465,8 @@ skip_adc:
     if (ret != ESP_OK) {
         ESP_LOGE(BATTERY_TAG, "❌ Failed to update battery percentage: %s", esp_err_to_name(ret));
     }
-    ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) %s", 
-             battery_voltage, percentage, force_report ? "FORCED REPORT" : "updated");
+    ESP_LOGI(BATTERY_TAG, "🔋 Li-Ion Battery: %.2fV (%.0f%%) (attributes updated)", 
+             battery_voltage, percentage);
 }
 
 /* Rain gauge initialization and handlers */
