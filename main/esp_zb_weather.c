@@ -425,16 +425,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
             ESP_LOGW(TAG, "⚠️ OTA upgrade in progress - preventing sleep");
             /* Don't call esp_zb_sleep_now() - let OTA complete */
             break;
-        }
-        
-        /* Optional: Log sleep cycles for debugging (uncomment to see wake/sleep activity)
-         * Note: This will increase power consumption due to UART activity
-         */
-        static uint32_t sleep_count = 0;
-        ESP_LOGI(TAG, "💤 Sleep cycle #%lu", ++sleep_count);
-        
-        /* Flush UART to ensure log is printed before sleeping */
-        esp_rom_output_tx_wait_idle(CONFIG_ESP_CONSOLE_UART_NUM);
+        }        
         
         /* LED is already deinitialized after successful join - no action needed */
         esp_zb_sleep_now();
