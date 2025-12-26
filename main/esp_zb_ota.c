@@ -18,6 +18,9 @@ static const char *TAG = "ESP_ZB_OTA";
 /* OTA upgrade status */
 static esp_zb_zcl_ota_upgrade_status_t ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_OK;
 
+/* OTA in progress flag - used to prevent sleep during transfer */
+static bool ota_transfer_active = false;
+
 /* OTA partition handle */
 static const esp_partition_t *update_partition = NULL;
 static esp_ota_handle_t update_handle = 0;
@@ -86,7 +89,15 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
             ESP_LOGI(TAG, "=== OTA UPGRADE STARTED ===");
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START;
+            ota_transfer_active = true;
             total_received = 0;
+
+            /* CRITICAL: Disable sleep during OTA to prevent transfer interruptions */
+            ESP_LOGW(TAG, "🚫 Disabling Zigbee sleep for OTA transfer");
+            esp_zb_sleep_enable(false);
+            
+            /* Set device to always-on mode during OTA */
+            esp_zb_set_rx_on_when_idle(true);
 
             // Begin OTA update
             ret = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
@@ -191,6 +202,13 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ESP_LOGI(TAG, "Total received: %ld bytes", total_received);
             ESP_LOGI(TAG, "Next boot will be from: %s", update_partition->label);
             ESP_LOGI(TAG, "Firmware will enter validation mode on next boot");
+            
+            /* Re-enable sleep before reboot (will be re-configured after reboot) */
+            ota_transfer_active = false;
+            ESP_LOGI(TAG, "✅ Re-enabling Zigbee sleep before reboot");
+            esp_zb_sleep_enable(true);
+            esp_zb_set_rx_on_when_idle(false);
+            
             ESP_LOGI(TAG, "Rebooting in 3 seconds...");
             
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY;
@@ -217,6 +235,12 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR:
             ESP_LOGE(TAG, "✗ OTA upgrade error");
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+            ota_transfer_active = false;
+
+            /* Re-enable sleep after OTA failure */
+            ESP_LOGW(TAG, "Re-enabling Zigbee sleep after OTA failure");
+            esp_zb_sleep_enable(true);
+            esp_zb_set_rx_on_when_idle(false);
 
             // Abort OTA if it was started
             if (update_handle) {
@@ -295,7 +319,5 @@ uint32_t esp_zb_ota_get_fw_version(void)
  */
 bool esp_zb_ota_is_active(void)
 {
-    return (ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START ||
-            ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE ||
-            ota_upgrade_status == ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY);
+    return ota_transfer_active;
 }
