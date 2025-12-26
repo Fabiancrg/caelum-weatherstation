@@ -1289,6 +1289,18 @@ static void bme280_read_and_report(uint8_t param)
         ESP_LOGW(TAG, "sensor_wake_and_measure() returned %s - will try to read cached/last values", esp_err_to_name(ret));
     }
 
+    /* Wait for BMP280 pressure conversion to complete (~10-15ms for osrs=1)
+     * This delay is needed when using SHT41+BMP280 combo because:
+     * 1. sht41_trigger_measurement() triggers+waits+reads (includes 10ms delay internally)
+     * 2. bmp280_trigger_measurement() only triggers (no delay)
+     * 3. We need to wait before calling bmp280_read_pressure_no_trigger()
+     * The SHT41 already waited 10ms, so we add an additional 10ms here to ensure
+     * BMP280 conversion is complete (total ~20ms, more than enough for both sensors) */
+    sensor_type_t sensor_type = sensor_get_type();
+    if (sensor_type == SENSOR_TYPE_SHT41_BMP280 || sensor_type == SENSOR_TYPE_AHT20_BMP280) {
+        vTaskDelay(pdMS_TO_TICKS(10)); // Extra delay for BMP280 pressure conversion
+    }
+
     /* Read temperature */
     ret = sensor_read_temperature(&temperature);
     if (ret == ESP_OK) {
@@ -1336,7 +1348,7 @@ static void bme280_read_and_report(uint8_t param)
             ESP_LOGE(TAG, "Failed to update pressure attribute: %s", esp_err_to_name(ret));
         }
     } else if (ret == ESP_ERR_NOT_SUPPORTED || ret == ESP_ERR_NOT_FOUND) {
-        ESP_LOGD(TAG, "Pressure not available from detected sensor (code=%s)", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "⚠️  Pressure not available from detected sensor (code=%s)", esp_err_to_name(ret));
     } else {
         ESP_LOGW(TAG, "sensor_read_pressure failed: %s", esp_err_to_name(ret));
     }

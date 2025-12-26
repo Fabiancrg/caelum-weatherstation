@@ -41,6 +41,13 @@ esp_err_t sensor_init(i2c_bus_handle_t i2c_bus)
         // Check if it's actually a BMP280 (no humidity) - if so, look for humidity sensor combo
         if (bme280_app_is_bmp280()) {
             ESP_LOGI(TAG, "BMP280 detected (no humidity), searching for separate humidity sensor...");
+            
+            // Initialize standalone BMP280 module for combo sensor support
+            esp_err_t bmp_ret = bmp280_init(i2c_bus);
+            if (bmp_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to initialize standalone BMP280 module: %s", esp_err_to_name(bmp_ret));
+            }
+            
             // Try to find SHT41 for humidity
             esp_err_t sht_ret = sht41_init(i2c_bus);
             if (sht_ret == ESP_OK) {
