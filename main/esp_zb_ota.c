@@ -14,9 +14,9 @@
 #include "zcl/esp_zigbee_zcl_ota.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_task_wdt.h"
 #include "esp_timer.h"
 #include "esp_sleep.h"
+#include "esp_pm.h"
 
 static const char *TAG = "ESP_ZB_OTA";
 
@@ -25,6 +25,9 @@ static esp_zb_zcl_ota_upgrade_status_t ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRA
 
 /* OTA in progress flag - used to prevent sleep during transfer */
 static bool ota_transfer_active = false;
+
+/* Power Management lock to prevent CPU frequency scaling and sleep during OTA */
+static esp_pm_lock_handle_t ota_pm_lock = NULL;
 
 /* OTA partition handle */
 static const esp_partition_t *update_partition = NULL;
@@ -37,6 +40,18 @@ static uint32_t total_received = 0;
 esp_err_t esp_zb_ota_init(void)
 {
     ESP_LOGI(TAG, "Initializing Zigbee OTA");
+    
+    /* Create Power Management lock to prevent sleep during OTA
+     * ESP_PM_NO_LIGHT_SLEEP prevents the device from entering light sleep,
+     * which would silence the UART console and potentially cause OTA timeouts */
+    esp_err_t ret = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "ota_no_sleep", &ota_pm_lock);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to create PM lock: %s (OTA will still work but console may go silent)", 
+                 esp_err_to_name(ret));
+        ota_pm_lock = NULL;  // Set to NULL so we know not to use it
+    } else {
+        ESP_LOGI(TAG, "✅ PM lock created - can prevent light sleep during OTA");
+    }
     
     // Get the currently running partition
     const esp_partition_t *running_partition = esp_ota_get_running_partition();
@@ -68,7 +83,7 @@ esp_err_t esp_zb_ota_init(void)
             
             // Mark the new firmware as valid if we reached here successfully
             // This prevents rollback to the previous version
-            esp_err_t ret = esp_ota_mark_app_valid_cancel_rollback();
+            ret = esp_ota_mark_app_valid_cancel_rollback();
             if (ret == ESP_OK) {
                 ESP_LOGI(TAG, "✓ OTA update validated successfully!");
                 ESP_LOGI(TAG, "New firmware is now permanent");
@@ -97,10 +112,10 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ota_transfer_active = true;
             total_received = 0;
 
-            /* CRITICAL: For Sleepy End Devices, we must:
+            /* CRITICAL: For Sleepy End Devices, prevent ALL sleep modes:
              * 1. Disable Zigbee sleep so device stays awake
              * 2. Set RX always-on so radio is listening
-             * 3. Disable ESP32 light sleep to prevent any sleep mode
+             * 3. Acquire PM lock to prevent ESP32 light sleep (keeps UART active!)
              */
             ESP_LOGW(TAG, "🚫 Disabling Zigbee sleep for OTA transfer");
             esp_zb_sleep_enable(false);
@@ -108,19 +123,30 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ESP_LOGW(TAG, "📡 Setting RX always-on for OTA transfer");
             esp_zb_set_rx_on_when_idle(true);
             
-            /* Also disable light sleep at the ESP32 level during OTA
-             * This ensures the device is fully responsive to incoming chunks */
-            ESP_LOGW(TAG, "🚫 Disabling ESP32 light sleep during OTA");
-            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            /* Acquire Power Management lock to prevent light sleep
+             * This is CRITICAL for keeping UART console active during OTA */
+            if (ota_pm_lock != NULL) {
+                ret = esp_pm_lock_acquire(ota_pm_lock);
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "🔒 PM lock acquired - light sleep disabled, UART will stay active");
+                } else {
+                    ESP_LOGW(TAG, "⚠️ Failed to acquire PM lock: %s", esp_err_to_name(ret));
+                }
+            }
             
             ESP_LOGI(TAG, "✅ OTA sleep prevention configured - device fully awake");
             ESP_LOGI(TAG, "⚡ Device is now in always-on mode for OTA reception");
+            ESP_LOGI(TAG, "📺 Console logging will remain active during OTA transfer");
 
             // Begin OTA update
             ret = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
             if (ret != ESP_OK) {
                 ESP_LOGE(TAG, "❌ esp_ota_begin failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
+                /* Release PM lock on error */
+                if (ota_pm_lock != NULL) {
+                    esp_pm_lock_release(ota_pm_lock);
+                }
                 return ret;
             }
             ESP_LOGI(TAG, "✅ OTA write session started - ready to receive chunks");
@@ -196,9 +222,6 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                 return ret;
             }
             
-            /* Feed watchdog to prevent timeout during long OTA transfers */
-            esp_task_wdt_reset();
-            
             // Log progress milestones
             static uint32_t last_milestone = 0;
             uint32_t current_milestone = total_received / 100000; // Every 100KB
@@ -251,7 +274,11 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             esp_zb_sleep_enable(true);
             esp_zb_set_rx_on_when_idle(false);
             
-            /* Note: Not re-enabling ESP32 sleep here since we're about to reboot */
+            /* Release PM lock to allow normal power management */
+            if (ota_pm_lock != NULL) {
+                esp_pm_lock_release(ota_pm_lock);
+                ESP_LOGI(TAG, "🔓 PM lock released - light sleep re-enabled");
+            }
             
             ESP_LOGI(TAG, "Rebooting in 3 seconds...");
             
@@ -286,8 +313,11 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             esp_zb_sleep_enable(true);
             esp_zb_set_rx_on_when_idle(false);
             
-            ESP_LOGW(TAG, "✅ Re-enabling ESP32 light sleep after OTA failure");
-            /* ESP32 sleep will be re-enabled by normal sleep_manager operations */
+            /* Release PM lock to allow normal power management */
+            if (ota_pm_lock != NULL) {
+                esp_pm_lock_release(ota_pm_lock);
+                ESP_LOGI(TAG, "🔓 PM lock released - light sleep re-enabled");
+            }
 
             // Abort OTA if it was started
             if (update_handle) {

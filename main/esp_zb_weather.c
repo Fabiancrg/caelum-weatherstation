@@ -1371,6 +1371,14 @@ static void bme280_read_and_report(uint8_t param)
 /* Periodic sensor reading timer callback */
 static void periodic_sensor_report_callback(void *arg)
 {
+    /* CRITICAL: Skip all sensor readings during OTA transfer
+     * I2C sensor operations (BME280, DS18B20) can take 10-100ms and block
+     * the Zigbee stack from responding to coordinator polls, causing OTA timeout */
+    if (esp_zb_ota_is_active()) {
+        ESP_LOGW(TAG, "⏰ Periodic timer fired but OTA in progress - skipping sensor read to prevent timeout");
+        return;
+    }
+    
     if (zigbee_network_connected) {
         ESP_LOGI(TAG, "⏰ Periodic sensor read timer fired (5-minute interval)");
         ESP_LOGI(TAG, "📊 Updating all endpoints: EP1=BME280, EP2=Rain, EP3=Pulse, EP4=DS18B20");
