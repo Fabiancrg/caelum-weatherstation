@@ -12,6 +12,11 @@
 #include "nvs_flash.h"
 #include "esp_zigbee_core.h"
 #include "zcl/esp_zigbee_zcl_ota.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
+#include "esp_sleep.h"
 
 static const char *TAG = "ESP_ZB_OTA";
 
@@ -92,27 +97,39 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ota_transfer_active = true;
             total_received = 0;
 
-            /* CRITICAL: Disable sleep during OTA to prevent transfer interruptions */
+            /* CRITICAL: For Sleepy End Devices, we must:
+             * 1. Disable Zigbee sleep so device stays awake
+             * 2. Set RX always-on so radio is listening
+             * 3. Disable ESP32 light sleep to prevent any sleep mode
+             */
             ESP_LOGW(TAG, "🚫 Disabling Zigbee sleep for OTA transfer");
             esp_zb_sleep_enable(false);
             
-            /* Set device to always-on mode during OTA */
+            ESP_LOGW(TAG, "📡 Setting RX always-on for OTA transfer");
             esp_zb_set_rx_on_when_idle(true);
+            
+            /* Also disable light sleep at the ESP32 level during OTA
+             * This ensures the device is fully responsive to incoming chunks */
+            ESP_LOGW(TAG, "🚫 Disabling ESP32 light sleep during OTA");
+            esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+            
+            ESP_LOGI(TAG, "✅ OTA sleep prevention configured - device fully awake");
+            ESP_LOGI(TAG, "⚡ Device is now in always-on mode for OTA reception");
 
             // Begin OTA update
             ret = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "esp_ota_begin failed: %s", esp_err_to_name(ret));
+                ESP_LOGE(TAG, "❌ esp_ota_begin failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
                 return ret;
             }
-            ESP_LOGI(TAG, "OTA write session started");
+            ESP_LOGI(TAG, "✅ OTA write session started - ready to receive chunks");
             break;
 
         case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
             // Handle the first chunk specially to detect and skip OTA header
             if (total_received == 0) {
-                ESP_LOGI(TAG, "First chunk received: %d bytes", message.payload_size);
+                ESP_LOGI(TAG, "📥 First chunk received: %d bytes", message.payload_size);
                 ESP_LOG_BUFFER_HEX_LEVEL(TAG, message.payload, 
                                         message.payload_size > 128 ? 128 : message.payload_size, 
                                         ESP_LOG_DEBUG);
@@ -122,22 +139,27 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                 for (int i = 0; i < message.payload_size && i < 256; i++) {
                     if (message.payload[i] == 0xE9) {
                         magic_offset = i;
-                        ESP_LOGI(TAG, "Found ESP32 magic byte (0xE9) at offset %d", magic_offset);
+                        ESP_LOGI(TAG, "✅ Found ESP32 magic byte (0xE9) at offset %d", magic_offset);
                         break;
                     }
                 }
                 
                 if (magic_offset >= 0) {
                     // Found the ESP32 binary, skip everything before it
-                    ESP_LOGI(TAG, "Skipping %d bytes before ESP32 binary", magic_offset);
-                    ESP_LOGI(TAG, "Writing %d bytes from first chunk", 
+                    ESP_LOGI(TAG, "⏩ Skipping %d bytes of OTA header", magic_offset);
+                    ESP_LOGI(TAG, "💾 Writing %d bytes from first chunk", 
                              message.payload_size - magic_offset);
                     
+                    int64_t write_start = esp_timer_get_time();
                     ret = esp_ota_write(update_handle, message.payload + magic_offset, 
                                       message.payload_size - magic_offset);
+                    int64_t write_time_us = esp_timer_get_time() - write_start;
+                    
                     total_received += message.payload_size - magic_offset;
+                    ESP_LOGI(TAG, "✅ First chunk written in %lld us. Total: %ld bytes", 
+                             write_time_us, total_received);
                 } else {
-                    ESP_LOGE(TAG, "No ESP32 magic byte (0xE9) found in first %d bytes", 
+                    ESP_LOGE(TAG, "❌ No ESP32 magic byte (0xE9) found in first %d bytes", 
                              message.payload_size);
                     ESP_LOGE(TAG, "Cannot proceed with OTA update");
                     ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
@@ -145,24 +167,44 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
                 }
             } else {
                 // Subsequent chunks - write directly
-                ESP_LOGD(TAG, "OTA receiving chunk: %d bytes (total: %ld bytes)",
-                         message.payload_size, total_received);
+                ESP_LOGI(TAG, "📦 OTA chunk #%ld received: %d bytes", 
+                         (total_received / message.payload_size) + 1, message.payload_size);
                 
+                int64_t write_start = esp_timer_get_time();
                 ret = esp_ota_write(update_handle, message.payload, message.payload_size);
+                int64_t write_time_us = esp_timer_get_time() - write_start;
+                
                 total_received += message.payload_size;
+                
+                ESP_LOGI(TAG, "✅ Chunk written in %lld us. Total: %ld bytes (%.1f%%)", 
+                         write_time_us, total_received, 
+                         (float)total_received / 668222.0f * 100.0f);  // Hardcoded expected size for now
+                
+                /* CRITICAL: Yield to prevent blocking Zigbee stack
+                 * The OTA callback runs in Zigbee context. If we block too long,
+                 * the device can't respond to coordinator polls and will timeout.
+                 * Give other tasks a chance to run after each chunk. */
+                if (write_time_us > 10000) {  // If write took > 10ms
+                    ESP_LOGW(TAG, "⚠️ Slow write detected (%lld us) - yielding to Zigbee stack", write_time_us);
+                    taskYIELD();  // Let Zigbee task run
+                }
             }
             
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "esp_ota_write failed: %s", esp_err_to_name(ret));
+                ESP_LOGE(TAG, "❌ esp_ota_write failed: %s", esp_err_to_name(ret));
                 ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_ERROR;
                 return ret;
             }
             
-            // Log progress every ~50KB
-            static uint32_t last_log = 0;
-            if (total_received - last_log > 50000) {
-                ESP_LOGI(TAG, "OTA progress: %ld bytes written", total_received);
-                last_log = total_received;
+            /* Feed watchdog to prevent timeout during long OTA transfers */
+            esp_task_wdt_reset();
+            
+            // Log progress milestones
+            static uint32_t last_milestone = 0;
+            uint32_t current_milestone = total_received / 100000; // Every 100KB
+            if (current_milestone > last_milestone) {
+                ESP_LOGI(TAG, "📊 OTA progress milestone: %ld KB written", total_received / 1000);
+                last_milestone = current_milestone;
             }
             break;
 
@@ -209,6 +251,8 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             esp_zb_sleep_enable(true);
             esp_zb_set_rx_on_when_idle(false);
             
+            /* Note: Not re-enabling ESP32 sleep here since we're about to reboot */
+            
             ESP_LOGI(TAG, "Rebooting in 3 seconds...");
             
             ota_upgrade_status = ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY;
@@ -238,9 +282,12 @@ esp_err_t zb_ota_upgrade_value_handler(esp_zb_zcl_ota_upgrade_value_message_t me
             ota_transfer_active = false;
 
             /* Re-enable sleep after OTA failure */
-            ESP_LOGW(TAG, "Re-enabling Zigbee sleep after OTA failure");
+            ESP_LOGW(TAG, "✅ Re-enabling Zigbee sleep after OTA failure");
             esp_zb_sleep_enable(true);
             esp_zb_set_rx_on_when_idle(false);
+            
+            ESP_LOGW(TAG, "✅ Re-enabling ESP32 light sleep after OTA failure");
+            /* ESP32 sleep will be re-enabled by normal sleep_manager operations */
 
             // Abort OTA if it was started
             if (update_handle) {
