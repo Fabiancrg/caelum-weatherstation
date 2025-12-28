@@ -251,6 +251,10 @@ static bool ds18b20_available = false;
 #define RAIN_FLUSH_INTERVAL_US       (10ULL * 1000ULL * 1000ULL) // 10 seconds
 static esp_timer_handle_t periodic_report_timer = NULL;
 
+/* Sensor reading task - runs in separate task to avoid blocking Zigbee scheduler */
+static QueueHandle_t sensor_read_queue = NULL;
+static TaskHandle_t sensor_read_task_handle = NULL;
+
 /* Network connection status (zigbee_network_connected declared earlier for LED functions) */
 static uint32_t connection_retry_count = 0;
 #define NETWORK_RETRY_SLEEP_DURATION    30      // 30 seconds for network retry
@@ -262,6 +266,7 @@ static uint32_t connection_retry_count = 0;
 static void builtin_button_callback(button_action_t action);
 static void factory_reset_device(uint8_t param);
 static void bme280_read_and_report(uint8_t param);
+static void sensor_read_task(void *arg);
 static void periodic_sensor_report_callback(void *arg);
 static void start_periodic_reading(void);
 static void stop_periodic_reading(void);
@@ -1280,7 +1285,34 @@ static void factory_reset_device(uint8_t param)
     esp_restart();
 }
 
-
+/* Sensor reading task - runs in dedicated FreeRTOS task context
+ * This is CRITICAL because sensor I2C operations contain vTaskDelay() which
+ * CANNOT be called from Zigbee scheduler context - causes deadlocks! */
+static void sensor_read_task(void *arg)
+{
+    uint8_t trigger;
+    ESP_LOGI(TAG, "📡 Sensor read task started");
+    
+    for (;;) {
+        // Wait for trigger from periodic timer
+        if (xQueueReceive(sensor_read_queue, &trigger, portMAX_DELAY)) {
+            ESP_LOGI(TAG, "📊 Sensor read task triggered");
+            
+            // Perform sensor reads with proper task delays
+            bme280_read_and_report(0);
+            ds18b20_read_and_report(0);
+            
+            // Update rain gauge and pulse counter
+            rain_gauge_request_flush(false, true);
+            pulse_counter_request_flush(false, true);
+            
+            // Battery reading
+            battery_read_and_report(0);
+            
+            ESP_LOGI(TAG, "✅ Sensor read task complete");
+        }
+    }
+}
 
 /* BME280 sensor reading and reporting functions */
 static void bme280_read_and_report(uint8_t param)
@@ -1392,25 +1424,13 @@ static void periodic_sensor_report_callback(void *arg)
         ESP_LOGI(TAG, "⏰ Periodic sensor read timer fired (5-minute interval)");
         ESP_LOGI(TAG, "📊 Updating all endpoints: EP1=BME280, EP2=Rain, EP3=Pulse, EP4=DS18B20");
         
-        /* Schedule sensor reads via Zigbee scheduler to avoid ISR context issues.
-         * Note: These functions update Zigbee attributes but don't force reporting.
-         * The Zigbee stack will automatically send reports based on the coordinator's
-         * reporting configuration (min/max intervals, reportable change thresholds). */
-        
-        /* Endpoint 1: BME280 (temperature, humidity, pressure, battery) */
-        esp_zb_scheduler_alarm((esp_zb_callback_t)bme280_read_and_report, 0, 100);
-        
-        /* Endpoint 4: DS18B20 temperature sensor */
-        esp_zb_scheduler_alarm((esp_zb_callback_t)ds18b20_read_and_report, 0, 200);
-        
-        /* Endpoint 2: Rain gauge */
-        rain_gauge_request_flush(false, true);
-        
-        /* Endpoint 3: Pulse counter */
-        pulse_counter_request_flush(false, true);
-        
-        /* Battery is read hourly based on its own time tracking */
-        esp_zb_scheduler_alarm((esp_zb_callback_t)battery_read_and_report, 0, 400);
+        /* CRITICAL: Trigger sensor reading task instead of using Zigbee scheduler.
+         * Sensor I2C operations contain vTaskDelay() which CANNOT be called from
+         * Zigbee scheduler context - causes deadlocks and device freeze! */
+        uint8_t trigger = 1;
+        if (sensor_read_queue != NULL) {
+            xQueueSend(sensor_read_queue, &trigger, 0);
+        }
     } else {
         ESP_LOGW(TAG, "⏰ Periodic timer fired but network disconnected - skipping sensor read");
     }
@@ -2148,6 +2168,15 @@ void app_main(void)
         ESP_LOGI(TAG, "📡 Network: Connected");
     } else {
         ESP_LOGW(TAG, "📡 Network: Disconnected (retries: %d/%d)", connection_retry_count, MAX_CONNECTION_RETRIES);
+    }
+    
+    /* Create sensor reading task and queue */
+    sensor_read_queue = xQueueCreate(5, sizeof(uint8_t));
+    if (sensor_read_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create sensor read queue");
+    } else {
+        xTaskCreate(sensor_read_task, "sensor_read", 4096, NULL, 4, &sensor_read_task_handle);
+        ESP_LOGI(TAG, "✅ Sensor read task created");
     }
     
     xTaskCreate(esp_zb_task, "Zigbee_main", 4096, NULL, 5, NULL);
